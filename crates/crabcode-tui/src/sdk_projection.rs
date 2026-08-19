@@ -1446,13 +1446,14 @@ impl Projection {
             .iter()
             .filter(|diagnostic| diagnostic.sequence == sequence)
             .count();
-        let (disposition, issue_code, root_error_code) =
+        let (outcome, declared_disposition, issue_code, root_error_code) =
             projection_effect_diagnostic_fields(&effect, &raw);
         self.diagnostics.record_envelope(
             &raw,
             self.direct_stream_activity.turn_generation,
             block_generation,
-            disposition,
+            outcome,
+            declared_disposition,
             issue_code,
             root_error_code,
             compatibility_count,
@@ -9204,40 +9205,72 @@ fn parse_stream_error(
     })
 }
 
+/// The policy class the contract *declares* for this envelope's stream event.
+///
+/// This is a static property of the event type, fixed before ingestion, and it
+/// says what would happen **if** the projection rejected the envelope. It is
+/// not a result, and on its own it never means anything went wrong. Non-stream
+/// envelopes declare no class.
+fn declared_stream_disposition(envelope: &RawEnvelope) -> Option<&'static str> {
+    let EnvelopeClass::StreamEvent {
+        event_type: Some(event_type),
+    } = &envelope.classification
+    else {
+        return None;
+    };
+    Some(match generated_stream_event_disposition(event_type) {
+        Some(GeneratedEventDisposition::PresentationOnly) => "presentation-only",
+        Some(GeneratedEventDisposition::Recoverable) => "recoverable",
+        Some(GeneratedEventDisposition::TurnFatal) => "turn-fatal",
+        Some(GeneratedEventDisposition::ProtocolFatal) => "protocol-fatal",
+        None => "recoverable",
+    })
+}
+
+/// Diagnostic fields for one ingested envelope, as
+/// `(outcome, declared_disposition, issue_code, root_error_code)`.
+///
+/// `outcome` is what actually happened to this envelope and is the only field
+/// that reports a failure. `declared_disposition` is the contract's static
+/// policy class for the event type, carried alongside so a reader can tell a
+/// severe *policy* from a severe *result*.
+///
+/// These were previously one conflated `disposition` field, which reported an
+/// accepted envelope under the name of its declared class. A journal from a
+/// healthy session consequently read as thousands of "turn-fatal" records, and
+/// the one genuine failure was indistinguishable from them at a glance.
 fn projection_effect_diagnostic_fields<'a>(
     effect: &'a ProjectionEffect,
     envelope: &RawEnvelope,
-) -> (&'static str, Option<&'a str>, Option<&'static str>) {
+) -> (
+    &'static str,
+    Option<&'static str>,
+    Option<&'a str>,
+    Option<&'static str>,
+) {
+    let declared = declared_stream_disposition(envelope);
     match effect {
         ProjectionEffect::SessionTransition { effect, .. } => {
             projection_effect_diagnostic_fields(effect, envelope)
         }
         ProjectionEffect::CompatibilityFault { code, .. } => {
-            ("recoverable", Some(code.as_str()), None)
+            ("recoverable", declared, Some(code.as_str()), None)
         }
         ProjectionEffect::AbortTurn { code, .. } => (
             "turn-fatal",
+            declared,
             Some(code.as_str()),
             Some("projection_turn_fatal"),
         ),
-        ProjectionEffect::FailClosed { .. } => {
-            ("protocol-fatal", None, Some("projection_protocol_fatal"))
-        }
-        _ => {
-            let disposition = match &envelope.classification {
-                EnvelopeClass::StreamEvent {
-                    event_type: Some(event_type),
-                } => match generated_stream_event_disposition(event_type) {
-                    Some(GeneratedEventDisposition::PresentationOnly) => "presentation-only",
-                    Some(GeneratedEventDisposition::Recoverable) => "recoverable",
-                    Some(GeneratedEventDisposition::TurnFatal) => "turn-fatal",
-                    Some(GeneratedEventDisposition::ProtocolFatal) => "protocol-fatal",
-                    None => "recoverable",
-                },
-                _ => "accepted",
-            };
-            (disposition, None, None)
-        }
+        ProjectionEffect::FailClosed { .. } => (
+            "protocol-fatal",
+            declared,
+            None,
+            Some("projection_protocol_fatal"),
+        ),
+        // The projection accepted the envelope. Say so, whatever the event
+        // type's declared class happens to be.
+        _ => ("accepted", declared, None, None),
     }
 }
 
@@ -10449,6 +10482,48 @@ mod tests {
             .iter()
             .any(|diagnostic| diagnostic.sequence == 1
                 && diagnostic.reason.contains("tail window advanced past")));
+    }
+
+    #[test]
+    fn an_accepted_envelope_is_journalled_as_accepted_whatever_its_declared_class() {
+        // `content_block_delta` -- among the most common events in any session
+        // -- declares TurnFatal, meaning "if this one is rejected, the turn
+        // dies". Before the split, every accepted delta was journalled under
+        // that class, so a healthy session produced thousands of "turn-fatal"
+        // records and the single real failure was invisible among them.
+        let delta = raw(
+            0,
+            json!({
+                "type":"stream_event",
+                "event":{"type":"content_block_delta"}
+            }),
+        );
+        let (outcome, declared, issue, root) =
+            projection_effect_diagnostic_fields(&ProjectionEffect::None, &delta);
+        assert_eq!(outcome, "accepted");
+        assert_eq!(declared, Some("turn-fatal"));
+        assert_eq!(issue, None);
+        assert_eq!(root, None);
+
+        // A real protocol failure still reports the failure in `outcome`, and
+        // the declared class rides alongside it rather than replacing it.
+        let (outcome, declared, _, root) = projection_effect_diagnostic_fields(
+            &ProjectionEffect::FailClosed {
+                sequence: 0,
+                reason: "boom".to_string(),
+            },
+            &delta,
+        );
+        assert_eq!(outcome, "protocol-fatal");
+        assert_eq!(declared, Some("turn-fatal"));
+        assert_eq!(root, Some("projection_protocol_fatal"));
+
+        // A non-stream envelope declares no class at all.
+        let progress = raw(1, json!({"type":"progress","data":{"type":"x"}}));
+        let (outcome, declared, _, _) =
+            projection_effect_diagnostic_fields(&ProjectionEffect::None, &progress);
+        assert_eq!(outcome, "accepted");
+        assert_eq!(declared, None);
     }
 
     #[test]

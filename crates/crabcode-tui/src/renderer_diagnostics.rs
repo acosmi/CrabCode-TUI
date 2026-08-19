@@ -19,7 +19,12 @@ const RAW_EVENT_DUMP_ENV: &str = "CRABCODE_TUI_RAW_EVENT_DUMP";
 const METADATA_FILE: &str = "tui-renderer-metadata.jsonl";
 const RAW_FILE: &str = "tui-renderer-raw-ring.jsonl";
 const MAX_JOURNAL_BYTES: u64 = 8 * 1024 * 1024;
-const DIAGNOSTIC_SCHEMA_VERSION: u64 = 1;
+/// v2 split the single `disposition` field, which used to report an accepted
+/// envelope under the name of its event type's declared policy class. It now
+/// carries the outcome only, and the class moved to `declared_disposition`.
+/// A v1 journal must not be read as if severe `disposition` values were
+/// failures: in v1 they usually were not.
+const DIAGNOSTIC_SCHEMA_VERSION: u64 = 2;
 
 #[derive(Clone, Default)]
 pub(crate) struct RendererDiagnostics {
@@ -54,12 +59,18 @@ impl RendererDiagnostics {
         })
     }
 
+    /// `outcome` is what actually happened to the envelope;
+    /// `declared_disposition` is the contract's static policy class for its
+    /// event type. Keeping them apart is what lets a reader tell a severe
+    /// policy from a severe result.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_envelope(
         &self,
         envelope: &RawEnvelope,
         turn_generation: u64,
         block_generation: Option<u64>,
-        disposition: &str,
+        outcome: &str,
+        declared_disposition: Option<&str>,
         issue_code: Option<&str>,
         root_error_code: Option<&str>,
         compatibility_count: usize,
@@ -74,7 +85,8 @@ impl RendererDiagnostics {
             envelope,
             turn_generation,
             block_generation,
-            disposition,
+            outcome,
+            declared_disposition,
             issue_code,
             root_error_code,
             compatibility_count,
@@ -103,7 +115,8 @@ impl DiagnosticSink {
         envelope: &RawEnvelope,
         turn_generation: u64,
         block_generation: Option<u64>,
-        disposition: &str,
+        outcome: &str,
+        declared_disposition: Option<&str>,
         issue_code: Option<&str>,
         root_error_code: Option<&str>,
         compatibility_count: usize,
@@ -112,7 +125,8 @@ impl DiagnosticSink {
             envelope,
             turn_generation,
             block_generation,
-            disposition,
+            outcome,
+            declared_disposition,
             issue_code,
             root_error_code,
             compatibility_count,
@@ -136,11 +150,13 @@ impl DiagnosticSink {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn metadata_record(
     envelope: &RawEnvelope,
     turn_generation: u64,
     block_generation: Option<u64>,
-    disposition: &str,
+    outcome: &str,
+    declared_disposition: Option<&str>,
     issue_code: Option<&str>,
     root_error_code: Option<&str>,
     compatibility_count: usize,
@@ -160,7 +176,14 @@ fn metadata_record(
         "encoded_len": envelope.encoded_len,
         "envelope_type": safe_discriminator(value.get("type").and_then(Value::as_str)),
         "stream_event_type": safe_discriminator(event.and_then(|event| event.get("type")).and_then(Value::as_str)),
-        "disposition": disposition,
+        // What actually happened to this envelope. "accepted" unless the
+        // projection reported a fault, so a scan for failures is a scan of
+        // this field alone.
+        "disposition": outcome,
+        // The contract's static policy class for the event type: what *would*
+        // happen if this envelope were rejected. Severe values here are normal
+        // in a healthy session and are not failures.
+        "declared_disposition": declared_disposition,
         "issue_code": issue_code,
         "root_error_code": root_error_code,
         "turn_generation": turn_generation,
@@ -467,7 +490,8 @@ mod tests {
             &envelope(0, json!({"type":"stream_event","event":{"type":"ping"}})),
             0,
             None,
-            "presentation-only",
+            "accepted",
+            Some("presentation-only"),
             None,
             None,
             0,
@@ -495,6 +519,7 @@ mod tests {
             4,
             Some(1),
             "turn-fatal",
+            Some("turn-fatal"),
             Some("content_block_start_invalid"),
             Some("projection_turn_fatal"),
             0,
@@ -567,7 +592,8 @@ mod tests {
                 ),
                 3,
                 None,
-                "presentation-only",
+                "accepted",
+                Some("presentation-only"),
                 None,
                 None,
                 0,
@@ -600,7 +626,8 @@ mod tests {
             ),
             1,
             None,
-            "presentation-only",
+            "accepted",
+            Some("presentation-only"),
             None,
             None,
             0,
