@@ -32,15 +32,33 @@ import type { CompactProgressEvent } from './toolContracts.js'
  */
 export type BashProgress = {
   type: 'bash_progress'
-  /** Tail of recent output lines (last progress slice). */
+  /** Last <=5 lines of the bounded output tail (see `fullOutput`). */
   output: string
-  /** Full accumulated stdout/stderr so far. */
+  /**
+   * Bounded *tail window* over stdout/stderr -- NOT a cumulative buffer.
+   *
+   * TaskOutput reads only the trailing PROGRESS_TAIL_BYTES (4096) of the
+   * backing file once per POLL_INTERVAL_MS (1000) and keeps the last 100
+   * lines of that read. A command that writes more than the window inside
+   * one poll tick therefore emits a window that has advanced clean past the
+   * previous one, with no overlap at all.
+   *
+   * Consumers must reconcile successive windows (or simply render the latest)
+   * and must never assume window N+1 starts with window N. `totalBytes`
+   * below reports exactly when bytes were dropped.
+   */
   fullOutput: string
   /** Wall-clock seconds since the command started. */
   elapsedTimeSeconds: number
-  /** Total number of output lines so far. */
+  /** Total output lines so far; extrapolated from the tail once truncated. */
   totalLines: number
-  /** Total bytes of output so far (0 when complete). */
+  /**
+   * Total bytes written by the command when `fullOutput` is a truncated view
+   * of them, and 0 when it holds the complete output.
+   *
+   * A non-zero value is the producer stating that bytes are missing from
+   * `fullOutput`, so it is the discriminator for "the window advanced".
+   */
   totalBytes?: number
   /** Background task ID when the command has been backgrounded. */
   taskId?: string
@@ -51,11 +69,14 @@ export type BashProgress = {
 /**
  * Progress emitted during PowerShell command execution.
  * Created in PowerShellTool.tsx via onProgress({ data: { type: 'powershell_progress', ... } }).
- * Shape mirrors BashProgress with a different discriminant.
+ * Shape mirrors BashProgress with a different discriminant -- including
+ * `fullOutput` being a bounded tail window rather than a cumulative buffer.
+ * See BashProgress above for the full contract.
  */
 export type PowerShellProgress = {
   type: 'powershell_progress'
   output: string
+  /** Bounded tail window, not a cumulative buffer. See BashProgress. */
   fullOutput: string
   elapsedTimeSeconds: number
   totalLines: number

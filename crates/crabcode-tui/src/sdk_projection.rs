@@ -4610,6 +4610,15 @@ impl Projection {
             "direct shell progress",
             envelope,
         )?;
+        // `totalBytes` is non-zero exactly when the producer truncated
+        // `fullOutput`: both shell tools forward
+        // `lastTotalBytes = isIncomplete ? totalBytes : 0`. The wire therefore
+        // already states whether a window that fails to overlap is routine or
+        // genuinely anomalous, so read it instead of inferring.
+        let producer_declared_truncation = total_bytes
+            .as_ref()
+            .and_then(serde_json::Number::as_u64)
+            .is_some_and(|bytes| bytes > 0);
         let timeout_ms = optional_number_at(
             value,
             &["data", "timeoutMs"],
@@ -4634,21 +4643,60 @@ impl Projection {
         let key = format!("direct-shell-progress:{parent_tool_use_id}");
         self.tool_names
             .insert(parent_tool_use_id.clone(), title.to_string());
-        if let Some(item) = self.item_mut(&key) {
-            if !full_output.starts_with(&item.text) {
-                return Err(format!(
-                    "direct shell progress fullOutput stopped being cumulative at sequence {}",
-                    envelope.sequence
-                ));
+        if self.item_mut(&key).is_some() {
+            let mut dropped_bytes = 0usize;
+            {
+                let item = self
+                    .item_mut(&key)
+                    .expect("presence checked on the line above");
+                if full_output.starts_with(&item.text) {
+                    // Fast path: the producer's tail window still covers every
+                    // byte projected so far, so append only its exact new
+                    // suffix. Arbitrary UTF-8 chunk boundaries keep byte order
+                    // and content without adding or changing a wire field.
+                    item.text.push_str(&full_output[item.text.len()..]);
+                } else {
+                    // `fullOutput` is a *bounded tail window* -- TaskOutput
+                    // keeps only the last PROGRESS_TAIL_BYTES / 100 lines --
+                    // not a cumulative buffer. A single burst larger than that
+                    // window scrolls already-projected bytes out of it. Re-anchor
+                    // on the longest overlap and mark the hole: a shell that
+                    // prints faster than the poll interval is not a protocol
+                    // violation and must never stop the runtime.
+                    let overlap =
+                        shell_progress_window_overlap(&item.text, &full_output);
+                    if overlap == 0 && !item.text.is_empty() {
+                        dropped_bytes = item.text.len();
+                        item.text.push_str(SHELL_PROGRESS_WINDOW_GAP);
+                    }
+                    item.text.push_str(&full_output[overlap..]);
+                }
+                trim_shell_progress_text(&mut item.text);
+                item.streaming = true;
+                item.raw_sequences.push(envelope.sequence);
+                item.presentation.direct_progress = Some(direct_progress);
             }
-            // `fullOutput` is the existing backend's documented cumulative
-            // stdout/stderr authority. Append only its exact new suffix so
-            // arbitrary UTF-8 chunk boundaries preserve byte order and
-            // content without adding or changing a wire field.
-            item.text.push_str(&full_output[item.text.len()..]);
-            item.streaming = true;
-            item.raw_sequences.push(envelope.sequence);
-            item.presentation.direct_progress = Some(direct_progress);
+            // A gap the producer itself declared is routine -- a command simply
+            // outran the poll interval -- and the scrollback marker already
+            // tells the reader. Journalling every one of those would let a
+            // chatty build evict real diagnostics from the retention budget, so
+            // only an *undeclared* gap is recorded as a compatibility signal.
+            if dropped_bytes > 0 && !producer_declared_truncation {
+                self.record_compatibility(
+                    envelope.sequence,
+                    ProjectionCompatibilityKind::StreamOverlap,
+                    None,
+                    None,
+                    format!(
+                        "direct shell progress tail window advanced past the \
+                         {dropped_bytes} projected bytes at sequence {} while \
+                         reporting complete output; the scrollback marks the \
+                         gap and the tool result keeps the saved output path",
+                        envelope.sequence
+                    ),
+                    false,
+                );
+            }
             return Ok(());
         }
         self.append_item(ProjectedItem {
@@ -9716,6 +9764,54 @@ fn value_to_inline_text(value: &Value) -> String {
     }
 }
 
+/// Marks where the producer's bounded progress tail window advanced past bytes
+/// the renderer had already projected. The complete output stays addressable
+/// through the saved-output path the tool result carries.
+const SHELL_PROGRESS_WINDOW_GAP: &str =
+    "
+... output truncated (progress tail window advanced) ...
+";
+
+/// Upper bound on the text one direct-shell item keeps projected. The tool
+/// result still carries the authoritative saved-output path, so the scrollback
+/// only needs a bounded recent view. Without this bound a chatty command would
+/// grow the projection without limit now that an advanced tail window is
+/// reconciled instead of stopping the runtime.
+const SHELL_PROGRESS_MAX_PROJECTED_BYTES: usize = 256 * 1024;
+
+/// Drop the oldest projected shell bytes once the item exceeds its retention
+/// bound, marking the hole exactly like an advanced producer window does.
+fn trim_shell_progress_text(text: &mut String) {
+    if text.len() <= SHELL_PROGRESS_MAX_PROJECTED_BYTES {
+        return;
+    }
+    let mut cut = text.len() - SHELL_PROGRESS_MAX_PROJECTED_BYTES;
+    while cut < text.len() && !text.is_char_boundary(cut) {
+        cut += 1;
+    }
+    let kept = text.split_off(cut);
+    text.clear();
+    text.push_str(SHELL_PROGRESS_WINDOW_GAP.trim_start_matches('\n'));
+    text.push_str(&kept);
+}
+
+/// Longest suffix of `projected` that is also a prefix of `window`, in bytes.
+/// Only UTF-8 character boundaries are considered so callers can slice safely.
+fn shell_progress_window_overlap(projected: &str, window: &str) -> usize {
+    let mut candidate = projected.len().min(window.len());
+    while candidate > 0 {
+        if projected.is_char_boundary(projected.len() - candidate)
+            && window.is_char_boundary(candidate)
+            && projected.as_bytes()[projected.len() - candidate..]
+                == window.as_bytes()[..candidate]
+        {
+            return candidate;
+        }
+        candidate -= 1;
+    }
+    0
+}
+
 fn string_at(value: &Value, path: &[&str]) -> Option<String> {
     let mut current = value;
     for component in path {
@@ -10304,7 +10400,7 @@ mod tests {
     }
 
     #[test]
-    fn fixed_direct_shell_progress_rejects_non_cumulative_full_output() {
+    fn fixed_direct_shell_progress_recovers_from_an_advanced_tail_window() {
         let mut projection = Projection::default();
         let first = json!({
             "type":"progress",
@@ -10335,16 +10431,130 @@ mod tests {
             "timestamp":"2026-07-27T00:00:01.000Z"
         });
         assert_eq!(projection.ingest(raw(0, first)), ProjectionEffect::None);
-        assert!(matches!(
+        // The producer's `fullOutput` is a bounded tail window, so a burst that
+        // outruns it legitimately drops projected bytes. The renderer re-anchors
+        // and marks the gap instead of stopping the runtime.
+        assert_eq!(
             projection.ingest(raw(1, conflicting.clone())),
-            ProjectionEffect::FailClosed {
-                sequence: 1,
-                reason
-            } if reason.contains("stopped being cumulative")
-        ));
+            ProjectionEffect::None
+        );
         assert_eq!(projection.raw_envelopes()[1].value, conflicting);
-        assert_eq!(projection.items()[0].text, "alpha");
+        assert_eq!(
+            projection.items()[0].text,
+            format!("alpha{SHELL_PROGRESS_WINDOW_GAP}beta")
+        );
         assert_eq!(projection.items().len(), 1);
+        assert!(projection
+            .compatibility_diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.sequence == 1
+                && diagnostic.reason.contains("tail window advanced past")));
+    }
+
+    #[test]
+    fn declared_tail_truncation_marks_the_gap_without_a_compatibility_record() {
+        let mut projection = Projection::default();
+        let progress = |sequence: u64, full: &str, total_bytes: u64| {
+            raw(
+                sequence,
+                json!({
+                    "type":"progress",
+                    "data":{
+                        "type":"bash_progress",
+                        "output":full,
+                        "fullOutput":full,
+                        "elapsedTimeSeconds":sequence + 1,
+                        "totalLines":1,
+                        // Non-zero `totalBytes` is the producer stating outright
+                        // that `fullOutput` is a truncated view of the output.
+                        "totalBytes":total_bytes
+                    },
+                    "toolUseID":format!("bash-progress-{sequence}"),
+                    "parentToolUseID":"shell-tool-4",
+                    "uuid":format!("progress-{sequence}"),
+                    "timestamp":"2026-07-27T00:00:00.000Z"
+                }),
+            )
+        };
+        assert_eq!(
+            projection.ingest(progress(0, "alpha", 0)),
+            ProjectionEffect::None
+        );
+        // A burst that outruns the poll interval: no overlap at all, and the
+        // producer says so. The session keeps running, the scrollback shows the
+        // hole, and no compatibility budget is spent on a declared truncation.
+        assert_eq!(
+            projection.ingest(progress(1, "omega", 16_528)),
+            ProjectionEffect::None
+        );
+        assert_eq!(
+            projection.items()[0].text,
+            format!("alpha{SHELL_PROGRESS_WINDOW_GAP}omega")
+        );
+        assert!(!projection
+            .compatibility_diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.sequence == 1));
+    }
+
+    #[test]
+    fn fixed_direct_shell_progress_reanchors_on_an_overlapping_tail_window() {
+        let mut projection = Projection::default();
+        let progress = |sequence: u64, full: &str, elapsed: u64| {
+            raw(
+                sequence,
+                json!({
+                    "type":"progress",
+                    "data":{
+                        "type":"bash_progress",
+                        "output":full,
+                        "fullOutput":full,
+                        "elapsedTimeSeconds":elapsed,
+                        "totalLines":1
+                    },
+                    "toolUseID":format!("bash-progress-{sequence}"),
+                    "parentToolUseID":"shell-tool-3",
+                    "uuid":format!("progress-{sequence}"),
+                    "timestamp":"2026-07-27T00:00:00.000Z"
+                }),
+            )
+        };
+        assert_eq!(
+            projection.ingest(progress(0, "abcdef", 1)),
+            ProjectionEffect::None
+        );
+        // The window slid forward by two bytes but still overlaps on "cdef",
+        // so only the exact new suffix is appended and no gap is marked.
+        assert_eq!(
+            projection.ingest(progress(1, "cdefgh", 2)),
+            ProjectionEffect::None
+        );
+        assert_eq!(projection.items()[0].text, "abcdefgh");
+        assert!(!projection.items()[0]
+            .text
+            .contains(SHELL_PROGRESS_WINDOW_GAP));
+    }
+
+    #[test]
+    fn shell_progress_text_stays_within_its_retention_bound() {
+        let mut text = "x".repeat(SHELL_PROGRESS_MAX_PROJECTED_BYTES + 10_000);
+        trim_shell_progress_text(&mut text);
+        assert!(text.len() <= SHELL_PROGRESS_MAX_PROJECTED_BYTES
+            + SHELL_PROGRESS_WINDOW_GAP.len());
+        assert!(text.starts_with(SHELL_PROGRESS_WINDOW_GAP.trim_start_matches('\n')));
+
+        // A text already inside the bound is left byte-for-byte alone.
+        let mut small = "abc".to_string();
+        trim_shell_progress_text(&mut small);
+        assert_eq!(small, "abc");
+    }
+
+    #[test]
+    fn shell_progress_window_overlap_stays_on_utf8_boundaries() {
+        // A multi-byte character must never be split when re-anchoring.
+        assert_eq!(shell_progress_window_overlap("ab\u{4f60}\u{597d}", "\u{4f60}\u{597d}cd"), 6);
+        assert_eq!(shell_progress_window_overlap("abc", "xyz"), 0);
+        assert_eq!(shell_progress_window_overlap("", "abc"), 0);
     }
 
     #[test]
