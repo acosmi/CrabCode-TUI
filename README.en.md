@@ -12,56 +12,58 @@ CrabCode TUI is CrabCode's terminal-only open-source edition. Rust owns the term
 
 ## Install
 
-The stable version is always the public GitHub `latest` Release. Ordinary installation is one command and does not require GitHub CLI:
+The stable version is always the public GitHub `latest` Release. Ordinary installation does not require GitHub CLI. Each command installs **only the archive for this machine**: it will not install macOS and Windows together, and it will not install Apple Silicon and Intel together. The Release contains all three platform archives; the installer fetches only the one that matches the host.
 
-> `latest` moves when a new version is published and executes a remote bootstrap first. To pin a version, use `CRABCODE_VERSION` or the offline asset mode below.
+> `latest` moves when a new version is published and executes a remote bootstrap first. When `CRABCODE_VERSION` is unset, the installer parses the unique host-platform archive from `latest`'s `checksums-sha256.txt` and does not call `api.github.com`. To pin a version, use `CRABCODE_VERSION` or the offline asset mode below.
 
-macOS:
+macOS (`uname -m` selects Apple Silicon → `arm64-darwin`, Intel → `x64-darwin`):
 
 ```bash
 curl -fsSL https://github.com/acosmi/CrabCode-TUI/releases/latest/download/install.sh | sh
 ```
 
-Windows PowerShell:
+Windows x64 (Windows PowerShell 5.1 or PowerShell 7):
 
 ```powershell
 irm https://github.com/acosmi/CrabCode-TUI/releases/latest/download/install.ps1 | iex
 ```
 
-The installer verifies the release SHA-256 and package per-file manifest. A Windows ZIP can also be checked with `gh attestation verify <ZIP-path> --repo acosmi/CrabCode-TUI`; macOS archives use the Release's `macos-local-provenance.json` and SSH signature instead of GitHub attestation. Release archives are provided only for macOS arm64, macOS x64, and Windows x64, and bundle `crabcode`, the native TUI, Bun, memory/cron sidecars, ripgrep, the browser backend, native image libraries, and the Account Bridge. Linux users can still build from source.
+Linux has no GitHub Release installer package; build from source. `install.ps1` is published as printable seven-bit ASCII without a BOM, so GitHub's `application/octet-stream` response does not turn the leading comment into an executable `ï»¿#` token under `irm | iex`.
+
+The installer verifies the release SHA-256 and package per-file manifest. A Windows ZIP can also be checked with `gh attestation verify <ZIP-path> --repo acosmi/CrabCode-TUI`; macOS archives use the Release's `macos-local-provenance.json` and SSH signature instead of GitHub attestation. Release archives are provided only for macOS arm64, macOS x64, and Windows x64, and bundle `crabcode`, the native TUI, Bun, memory/cron sidecars, ripgrep, the browser backend, native image libraries, and the Account Bridge.
 
 ### Installer variables
 
-Both `install.sh` on macOS and `install.ps1` on Windows support these environment variables:
+Both `install.sh` on macOS and `install.ps1` on Windows support these environment variables. OS and CPU architecture have no installer variables; the host is detected automatically.
 
 | Variable | Purpose | Default / constraint |
 | --- | --- | --- |
-| `CRABCODE_VERSION` | Pin the version; accepts `1.0.35` or `v1.0.35` | When unset, the installer selects the version from the `latest` checksum manifest |
+| `CRABCODE_VERSION` | Pin the version; accepts `1.0.36` or `v1.0.36` | When unset, the installer selects the unique host-platform archive from the `latest` checksum manifest |
 | `CRABCODE_ASSET_DIR` | Install from downloaded assets | Must be an absolute path and used with `CRABCODE_VERSION`; the directory must contain the platform archive and `checksums-sha256.txt` |
 | `CRABCODE_BIN_DIR` | Location of the stable `crabcode` / `crabcode.exe` launcher | macOS: `~/.local/bin`; Windows: `%USERPROFILE%\.crabcode\bin`; use an absolute path when overriding |
 | `XDG_DATA_HOME` | Root for immutable installed versions | macOS: `$HOME/.local/share`; Windows: `%USERPROFILE%\.local\share`; use an absolute path when overriding |
 
-Pinned online install (using `1.0.35` as an example):
+Pinned online install (using `1.0.36` as an example):
 
 ```bash
-curl -fsSL https://github.com/acosmi/CrabCode-TUI/releases/download/v1.0.35/install.sh -o /tmp/crabcode-install.sh
-CRABCODE_VERSION=1.0.35 sh /tmp/crabcode-install.sh
+curl -fsSL https://github.com/acosmi/CrabCode-TUI/releases/download/v1.0.36/install.sh -o /tmp/crabcode-install.sh
+CRABCODE_VERSION=1.0.36 sh /tmp/crabcode-install.sh
 ```
 
 ```powershell
-$env:CRABCODE_VERSION = '1.0.35'
-irm https://github.com/acosmi/CrabCode-TUI/releases/download/v1.0.35/install.ps1 | iex
+$env:CRABCODE_VERSION = '1.0.36'
+irm https://github.com/acosmi/CrabCode-TUI/releases/download/v1.0.36/install.ps1 | iex
 Remove-Item Env:CRABCODE_VERSION
 ```
 
 For an offline install, put the installer, platform archive, and `checksums-sha256.txt` in one directory:
 
 ```bash
-CRABCODE_VERSION=1.0.35 CRABCODE_ASSET_DIR=/absolute/path/crabcode-assets sh /absolute/path/crabcode-assets/install.sh
+CRABCODE_VERSION=1.0.36 CRABCODE_ASSET_DIR=/absolute/path/crabcode-assets sh /absolute/path/crabcode-assets/install.sh
 ```
 
 ```powershell
-$env:CRABCODE_VERSION='1.0.35'; $env:CRABCODE_ASSET_DIR='C:\crabcode-assets'; & "$env:CRABCODE_ASSET_DIR\install.ps1"
+$env:CRABCODE_VERSION='1.0.36'; $env:CRABCODE_ASSET_DIR='C:\crabcode-assets'; & "$env:CRABCODE_ASSET_DIR\install.ps1"
 ```
 
 Offline mode makes no network requests, and the installer detects the CPU architecture automatically. `CRABCODE_CONFIG_DIR` is not an install-location variable; it isolates runtime configuration and sessions after installation.
