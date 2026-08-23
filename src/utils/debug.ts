@@ -1,6 +1,6 @@
 import { appendFile, mkdir, symlink, unlink } from 'fs/promises'
 import memoize from 'lodash-es/memoize.js'
-import { dirname, join } from 'path'
+import { dirname, join, sep } from 'path'
 import { getSessionId } from 'src/bootstrap/state.js'
 
 import { type BufferedWriter, createBufferedWriter } from './bufferedWriter.js'
@@ -227,10 +227,60 @@ export function logForDebugging(
   getDebugWriter().write(output)
 }
 
+/**
+ * True when `value` ends in something the current platform reads as a path
+ * separator. `sep` is `\` on Windows and `/` elsewhere; the extra `/` covers
+ * Windows paths written with forward slashes, which the OS accepts too. On
+ * POSIX both checks collapse to `/`, so a trailing backslash stays what it
+ * really is there — an ordinary filename character.
+ */
+function endsWithPathSeparator(value: string): boolean {
+  return value.endsWith(sep) || value.endsWith('/')
+}
+
+/**
+ * Resolves `CRABCODE_DEBUG_LOGS_DIR` to an actual log *file* path.
+ *
+ * The variable is named `_DIR` and the default branch below builds
+ * `<dir>/<session>.txt`, but this branch used to return the raw value as if it
+ * were a file. Passing the directory the name promises therefore killed the
+ * process on the first write (`EISDIR: illegal operation on a directory`) — a
+ * troubleshooting switch that took down the thing being troubleshot, and with
+ * it `CRABCODE_PROFILE_STARTUP`, whose report is emitted through this log.
+ *
+ * So: a value that already exists as a directory, or that is written with a
+ * trailing separator (the caller's way of saying "directory" for a path that
+ * doesn't exist yet), gets the session filename appended. Anything else is
+ * honoured as an explicit file path, which is what existing users of this
+ * variable rely on.
+ *
+ * Memoized per value: `getDebugLogPath()` runs on every buffered write, so the
+ * `statSync` must not repeat per log line, and the destination must not shift
+ * mid-session if the directory happens to be created while the process runs.
+ */
+const resolveDebugLogsDirEnv = memoize((value: string): string => {
+  if (endsWithPathSeparator(value)) {
+    return join(value, `${getSessionId()}.txt`)
+  }
+  try {
+    if (getFsImplementation().statSync(value).isDirectory()) {
+      return join(value, `${getSessionId()}.txt`)
+    }
+  } catch {
+    // Doesn't exist (or can't be stat'd) and wasn't spelled as a directory:
+    // treat it as the file path the caller wants created.
+  }
+  return value
+})
+
 export function getDebugLogPath(): string {
+  // Empty/blank is "unset", not "log to the current directory": honouring it
+  // would hand appendFileSync an unopenable path and crash the same way the
+  // directory case did.
+  const logsDirEnv = process.env.CRABCODE_DEBUG_LOGS_DIR?.trim()
   return (
     getDebugFilePath() ??
-    process.env.CRABCODE_DEBUG_LOGS_DIR ??
+    (logsDirEnv ? resolveDebugLogsDirEnv(logsDirEnv) : undefined) ??
     join(getCrabCodeConfigHomeDir(), 'debug', `${getSessionId()}.txt`)
   )
 }
