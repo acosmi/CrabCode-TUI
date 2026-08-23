@@ -1,6 +1,6 @@
 {
   "name": "crabcode-tui",
-  "version": "1.0.36",
+  "version": "1.0.37",
   "private": true,
   "description": "Open-source CrabCode native terminal UI and its direct backend runtime",
   "license": "MIT",

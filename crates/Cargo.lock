@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "acosmi-config"
-version = "1.0.36"
+version = "1.0.37"
 dependencies = [
  "acosmi-types",
  "anyhow",
@@ -24,7 +24,7 @@ dependencies = [
 
 [[package]]
 name = "acosmi-cron-ledger"
-version = "1.0.36"
+version = "1.0.37"
 dependencies = [
  "acosmi-scheduler",
  "chrono",
@@ -41,7 +41,7 @@ dependencies = [
 
 [[package]]
 name = "acosmi-daemon-launcher"
-version = "1.0.36"
+version = "1.0.37"
 dependencies = [
  "acosmi-config",
  "anyhow",
@@ -61,7 +61,7 @@ dependencies = [
 
 [[package]]
 name = "acosmi-exec"
-version = "1.0.36"
+version = "1.0.37"
 dependencies = [
  "kill_tree",
  "libc",
@@ -75,7 +75,7 @@ dependencies = [
 
 [[package]]
 name = "acosmi-executor"
-version = "1.0.36"
+version = "1.0.37"
 dependencies = [
  "acosmi-exec",
  "acosmi-types",
@@ -89,7 +89,7 @@ dependencies = [
 
 [[package]]
 name = "acosmi-generation-lease"
-version = "1.0.36"
+version = "1.0.37"
 dependencies = [
  "anyhow",
  "dirs",
@@ -103,7 +103,7 @@ dependencies = [
 
 [[package]]
 name = "acosmi-heartbeat"
-version = "1.0.36"
+version = "1.0.37"
 dependencies = [
  "serde",
  "serde_json",
@@ -115,7 +115,7 @@ dependencies = [
 
 [[package]]
 name = "acosmi-index"
-version = "1.0.36"
+version = "1.0.37"
 dependencies = [
  "globset",
  "ignore",
@@ -131,7 +131,7 @@ dependencies = [
 
 [[package]]
 name = "acosmi-permission"
-version = "1.0.36"
+version = "1.0.37"
 dependencies = [
  "acosmi-config",
  "acosmi-shell-parser",
@@ -146,7 +146,7 @@ dependencies = [
 
 [[package]]
 name = "acosmi-sandbox"
-version = "1.0.36"
+version = "1.0.37"
 dependencies = [
  "acosmi-types",
  "anyhow",
@@ -167,7 +167,7 @@ dependencies = [
 
 [[package]]
 name = "acosmi-scheduler"
-version = "1.0.36"
+version = "1.0.37"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -186,7 +186,7 @@ dependencies = [
 
 [[package]]
 name = "acosmi-shell-parser"
-version = "1.0.36"
+version = "1.0.37"
 dependencies = [
  "async-trait",
  "lru 0.16.4",
@@ -200,7 +200,7 @@ dependencies = [
 
 [[package]]
 name = "acosmi-supervisor"
-version = "1.0.36"
+version = "1.0.37"
 dependencies = [
  "acosmi-config",
  "acosmi-exec",
@@ -231,7 +231,7 @@ dependencies = [
 
 [[package]]
 name = "acosmi-types"
-version = "1.0.36"
+version = "1.0.37"
 dependencies = [
  "async-trait",
  "chrono",
@@ -246,7 +246,7 @@ dependencies = [
 
 [[package]]
 name = "acosmi-util-absolute-path"
-version = "1.0.36"
+version = "1.0.37"
 dependencies = [
  "dirs",
  "dunce",
@@ -1041,7 +1041,7 @@ dependencies = [
 
 [[package]]
 name = "crabcode-cli"
-version = "1.0.36"
+version = "1.0.37"
 dependencies = [
  "acosmi-daemon-launcher",
  "acosmi-generation-lease",
@@ -1060,7 +1060,7 @@ dependencies = [
 
 [[package]]
 name = "crabcode-cron"
-version = "1.0.36"
+version = "1.0.37"
 dependencies = [
  "acosmi-config",
  "acosmi-cron-ledger",
@@ -1085,7 +1085,7 @@ dependencies = [
 
 [[package]]
 name = "crabcode-markdown"
-version = "1.0.36"
+version = "1.0.37"
 dependencies = [
  "anstyle",
  "anstyle-lossy",
@@ -1106,7 +1106,7 @@ dependencies = [
 
 [[package]]
 name = "crabcode-markdown-core"
-version = "1.0.36"
+version = "1.0.37"
 dependencies = [
  "pulldown-cmark",
 ]
@@ -1130,7 +1130,7 @@ dependencies = [
 
 [[package]]
 name = "crabcode-pager-render"
-version = "1.0.36"
+version = "1.0.37"
 dependencies = [
  "anstyle",
  "base64",
@@ -1215,7 +1215,7 @@ dependencies = [
 
 [[package]]
 name = "crabcode-tui"
-version = "1.0.36"
+version = "1.0.37"
 dependencies = [
  "acosmi-daemon-launcher",
  "acosmi-index",
