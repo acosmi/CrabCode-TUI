@@ -157,6 +157,30 @@ async fn run_coordinator() -> Result<()> {
     loop {
         let started = Instant::now();
         let mut command = tokio::process::Command::new(&executable);
+        // The coordinator is spawned DETACHED_PROCESS, so it owns no console.
+        // Creating a console-subsystem child from it with no creation flags
+        // makes Windows allocate a fresh console, which Windows 11 hands off to
+        // the default terminal app -- a stray terminal window appears on every
+        // start and on every restart below. Closing that window then delivers
+        // CTRL_CLOSE_EVENT to the child, which exits 0xC000013A
+        // (STATUS_CONTROL_C_EXIT) and gets restarted here, spawning yet another
+        // window.
+        //
+        // CREATE_NO_WINDOW gives the child a console with no window, so nothing
+        // is displayed and nothing can close it, while the inherited stdout and
+        // stderr log-file handles below keep working. CREATE_NEW_PROCESS_GROUP
+        // additionally keeps a console control event aimed at the client from
+        // reaching the shared daemon. Note that CREATE_NO_WINDOW and
+        // DETACHED_PROCESS are mutually exclusive; only the former belongs here
+        // because the child must retain those inherited handles.
+        #[cfg(windows)]
+        {
+            // `creation_flags` is inherent on tokio's Command on Windows, so no
+            // `CommandExt` import is needed here.
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+            command.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+        }
         command
             .env(COORDINATOR_ENV, "0")
             .env(COORDINATOR_CHILD_ENV, "1")

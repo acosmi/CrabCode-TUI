@@ -28880,6 +28880,77 @@ mod tests {
         assert!(!help.help_tabs[2].body.contains("visible-builtin"));
     }
 
+    /// The producer publishes one command's alternate spellings as `hidden`
+    /// rows. Discovery must collapse to a single row per command while every
+    /// spelling stays typed-dispatchable, including the gated session tokens
+    /// whose fail-closed copy only applies when the catalog lacks the token.
+    #[test]
+    fn hidden_alias_catalog_rows_collapse_discovery_without_revoking_dispatch() {
+        let mut app = TuiApp::new(
+            &json!({"commands":[
+                {
+                    "name":"clear",
+                    "description":"Clear conversation history",
+                    "argumentHint":"",
+                    "builtin":true
+                },
+                {
+                    "name":"new",
+                    "description":"Clear conversation history",
+                    "argumentHint":"",
+                    "hidden":true,
+                    "builtin":true
+                },
+                {
+                    "name":"reset",
+                    "description":"Clear conversation history",
+                    "argumentHint":"",
+                    "hidden":true,
+                    "builtin":true
+                }
+            ]}),
+            InitialSessionRequest::New,
+            None,
+        );
+        app.release_startup_barrier_for_test();
+        app.setup_lifecycle_phase = SetupLifecyclePhase::Initialized;
+
+        assert_eq!(
+            app.completion_commands
+                .iter()
+                .filter(|command| command.description == "Clear conversation history")
+                .map(|command| command.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["clear"],
+            "one command must contribute exactly one discoverable row"
+        );
+
+        for alias in ["/reset", "/new"] {
+            assert!(
+                app.runtime_catalog_contains(alias),
+                "{alias} must stay in the unfiltered runtime catalog"
+            );
+        }
+
+        app.composer.set_text("/reset");
+        app.composer.set_cursor(app.composer.text().len());
+        app.refresh_command_palette();
+        assert!(
+            app.visible_command_suggestions()
+                .all(|(_, command)| command.name != "reset" && command.name != "new"),
+            "alias spellings must never be offered as their own command"
+        );
+
+        assert_eq!(
+            app.submit_composer(),
+            vec![HostAction::SendUser {
+                content: Value::String("/reset".to_string()),
+                priority: None,
+            }],
+            "a hidden alias must still execute verbatim"
+        );
+    }
+
     #[test]
     fn background_catalog_refresh_atomically_updates_dispatch_palette_help_and_ack() {
         let mut app = TuiApp::new(

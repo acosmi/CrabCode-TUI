@@ -139,11 +139,13 @@ describe('direct TUI authentication control lifecycle', () => {
         StdoutMessage,
         { type: 'control_response' }
       >
+      // The direct-TUI logout catalog is delivered in name order so a
+      // background reprojection of the same inventory is byte-identical.
       expect(
         response.response.response?.commands.map(item => item.name),
       ).toEqual(
         slashCommandsEnabled
-          ? ['public-after-auth-transition', 'mcp__live__prompt']
+          ? ['mcp__live__prompt', 'public-after-auth-transition']
           : [],
       )
     }

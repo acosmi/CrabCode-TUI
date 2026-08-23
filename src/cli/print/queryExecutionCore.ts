@@ -396,7 +396,11 @@ import {
 } from '../../utils/envUtils.js'
 import { installPluginsForHeadless } from '../../utils/plugins/headlessPluginInstall.js'
 import { getInitialSettings } from '../../utils/settings/settings.js'
-import { refreshActivePlugins } from '../../utils/plugins/refresh.js'
+import {
+  recordPluginDiscoveryFingerprint,
+  refreshActivePlugins,
+  refreshActivePluginsIfDiscoveryChanged,
+} from '../../utils/plugins/refresh.js'
 import { loadAllPluginsCacheOnly } from '../../utils/plugins/pluginLoader.js'
 import {
   isTeamLead,
@@ -712,6 +716,13 @@ async function runHeadlessCore(
   // StructuredIO. Set the transport fact at their shared execution boundary;
   // product interactivity is an independent route policy.
   setUsesStructuredIoTransport(true)
+  // Baseline the plugin discovery inputs before this process can write to any
+  // of them (the settings download fired below, the plugin installer, managed
+  // settings). The caller already awaited the startup discovery pass — the
+  // `commands`/`agents` arguments ARE its output — so this baseline describes
+  // the disk that the currently loaded plugin state was built from. Any write
+  // after this line changes the fingerprint and forces the refresh.
+  recordPluginDiscoveryFingerprint()
   installSkillCommandCacheInvalidator(preserveSkillCache => {
     if (preserveSkillCache) {
       clearHeadlessCommandMemoizationCaches()
@@ -3057,7 +3068,12 @@ function runHeadlessStreaming(
   }
 
   // NOTE: Nested function required - needs closure access to applyMcpServerChanges and updateSdkMcp
-  async function installPluginsAndApplyMcpInBackground(): Promise<void> {
+  //
+  // Returns whether the installer actually installed/uninstalled anything, so
+  // the caller can decide whether a second full plugin discovery pass is
+  // justified. A thrown installer reports `true`: it cannot tell us what it did,
+  // so the decision falls through to the discovery fingerprint.
+  async function installPluginsAndApplyMcpInBackground(): Promise<boolean> {
     try {
       // Join point for user settings (fired at runHeadless entry) and managed
       // settings (fired in main.tsx preAction). downloadUserSettings() caches
@@ -3081,8 +3097,10 @@ function runHeadlessStreaming(
       } else if (pluginsInstalled) {
         await applyPluginMcpDiff()
       }
+      return pluginsInstalled
     } catch (error) {
       logError(error)
+      return true
     }
   }
 
@@ -3090,7 +3108,7 @@ function runHeadlessStreaming(
   // Installs marketplaces from extraKnownMarketplaces and missing enabled plugins
   // CRABCODE_SYNC_PLUGIN_INSTALL=true: resolved in run() before the first
   // query so plugins are guaranteed available on the first ask().
-  let pluginInstallPromise: Promise<void> | null = null
+  let pluginInstallPromise: Promise<boolean> | null = null
   // --bare / SIMPLE: skip plugin install. Scripted calls don't add plugins
   // mid-session; the next interactive run reconciles.
   if (!isBareMode()) {
@@ -3098,7 +3116,16 @@ function runHeadlessStreaming(
       pluginInstallPromise = installPluginsAndApplyMcpInBackground()
     } else {
       void installPluginsAndApplyMcpInBackground()
-        .then(() => refreshPluginState())
+        .then(installerChangedPlugins =>
+          // setup() already ran the startup discovery pass for this route
+          // (skipPluginPrefetch is false without CRABCODE_SYNC_PLUGIN_INSTALL),
+          // so a second full pass is only warranted when the installer changed
+          // something — or, as a second line of defense, when a settings /
+          // marketplace file was rewritten inside the startup window.
+          refreshPluginState({
+            skipWhenDiscoveryInputsUnchanged: !installerChangedPlugins,
+          }),
+        )
         .catch(error => logError(error))
     }
   }
@@ -3199,12 +3226,25 @@ function runHeadlessStreaming(
   // loadAllPlugins() may have run during main.tsx startup BEFORE managed
   // settings were fetched. Without clearing, getCommands() would rebuild
   // from a stale plugin list.
-  async function refreshPluginState(): Promise<void> {
+  //
+  // `skipWhenDiscoveryInputsUnchanged` is only safe for callers that can prove a
+  // first discovery pass already ran. The sync-install path cannot: setup()
+  // skips prefetchActiveCommands AND loadPluginHooks under
+  // CRABCODE_SYNC_PLUGIN_INSTALL, so its refresh IS the first pass and must
+  // always do the full sweep.
+  async function refreshPluginState({
+    skipWhenDiscoveryInputsUnchanged = false,
+  }: { skipWhenDiscoveryInputsUnchanged?: boolean } = {}): Promise<void> {
     // refreshActivePlugins handles the full cache sweep (clearAllCaches),
     // reloads all plugin component loaders, writes AppState.plugins +
     // AppState.agentDefinitions, registers hooks, and bumps mcp.pluginReconnectKey.
-    const { agentDefinitions: freshAgentDefs } =
-      await refreshActivePlugins(setAppState)
+    const refreshed = skipWhenDiscoveryInputsUnchanged
+      ? await refreshActivePluginsIfDiscoveryChanged(setAppState)
+      : await refreshActivePlugins(setAppState)
+    // Skipped: nothing was swept and nothing was reloaded, so re-publishing the
+    // command catalog would send a byte-identical catalog a second time.
+    if (!refreshed) return
+    const { agentDefinitions: freshAgentDefs } = refreshed
 
     // Headless-specific: currentCommands/currentAgents are local mutable refs
     // captured by the query loop (REPL uses AppState instead). getCommands is

@@ -419,6 +419,10 @@ mod tests {
     }
 
     #[test]
+    // The unix socket path is production code only under `#[cfg(unix)]`; the
+    // Windows build takes the `npipe:` arm instead. Without this gate the test
+    // asserts POSIX literals against a `Path::join` that yields `\` on Windows.
+    #[cfg(unix)]
     fn memory_unix_socket_is_stable_per_state_root_and_handles_long_paths() {
         let short_root = PathBuf::from("/tmp/crabcode-memory-short-root");
         assert_eq!(

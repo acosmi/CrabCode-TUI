@@ -1,15 +1,17 @@
 import * as fs from 'fs/promises'
 import { homedir } from 'os'
-import { join } from 'path'
+import { basename, isAbsolute, join, relative, resolve } from 'path'
 import { logEvent } from '../services/analytics/index.js'
 import { CACHE_PATHS } from './cachePaths.js'
 import { logForDebugging } from './debug.js'
 import { getCrabCodeConfigHomeDir } from './envUtils.js'
+import { getErrnoCode } from './errors.js'
 import { type FsOperations, getFsImplementation } from './fsOperations.js'
 import { cleanupOldImageCaches } from './imageStore.js'
 import * as lockfile from './lockfile.js'
 import { logError } from './log.js'
 import { cleanupOldPastes } from './pasteStore.js'
+import { getPluginsDirectory } from './plugins/pluginDirectories.js'
 import { getProjectsDir } from './sessionStorage.js'
 import { getSettingsWithAllErrors } from './settings/allErrors.js'
 import {
@@ -427,6 +429,369 @@ export async function cleanupOldDebugLogs(): Promise<CleanupResult> {
   return result
 }
 
+const ONE_HOUR_MS = 60 * 60 * 1000
+const SHELL_SNAPSHOT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000
+
+/**
+ * `.marketplace-add-<pid>-<uuid>.staging`, exactly as
+ * `marketplaceAddStagingName()` writes it (`randomUUID()` is always the
+ * canonical lowercase 8-4-4-4-12 form). Anchored on purpose: a loose
+ * `.marketplace-add-*` glob would also swallow the *unsuffixed* staging path
+ * a live install is still writing into.
+ */
+const MARKETPLACE_STAGING_DIR_NAME =
+  /^\.marketplace-add-(\d+)-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.staging$/i
+
+/**
+ * `snapshot-<zsh|bash|sh>-<epochMs>-<rand>.sh`, exactly as
+ * `createAndSaveSnapshot()` writes it. The shell type is a closed set there,
+ * so it is spelled out rather than wildcarded — `shell-snapshots/` is under
+ * the user's config home and nothing else in it may be matched by accident.
+ */
+const SHELL_SNAPSHOT_FILE_NAME = /^snapshot-(?:zsh|bash|sh)-\d+-[0-9a-z]+\.sh$/
+
+/** Windows path comparison is case-insensitive; POSIX is not. */
+function normalizeEntryName(name: string): string {
+  return process.platform === 'win32' ? name.toLowerCase() : name
+}
+
+/**
+ * The first path segment of `candidate` below `root`, or null when
+ * `candidate` is not below `root` at all (including when it *is* `root`).
+ */
+function firstSegmentUnder(root: string, candidate: string): string | null {
+  const rel = relative(root, candidate)
+  if (rel.length === 0 || rel.startsWith('..') || isAbsolute(rel)) {
+    return null
+  }
+  const segment = rel.split(/[\\/]/)[0]
+  return segment !== undefined && segment.length > 0 ? segment : null
+}
+
+/**
+ * Whether `pid` still names a live process.
+ *
+ * `process.kill(pid, 0)` delivers no signal — it only probes — and the three
+ * outcomes must be told apart, because "cannot tell" has to mean *alive*:
+ * deleting a staging directory out from under a running install is the one
+ * failure this cleanup must never produce.
+ *
+ *   - returns normally  → live.
+ *   - throws ESRCH      → no such process. The only answer that permits a delete.
+ *   - throws otherwise  → live, or unknowable. On POSIX an EPERM means the
+ *     process exists under another uid. On Windows libuv's `uv_kill` opens the
+ *     process and maps ERROR_INVALID_PARAMETER (no such pid) to ESRCH while
+ *     ERROR_ACCESS_DENIED surfaces as EPERM/EACCES — so "gone" and "present but
+ *     not openable" really are distinguishable there, and everything that is
+ *     not a definite ESRCH is treated as present.
+ */
+function isProcessAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return true
+  }
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return getErrnoCode(error) !== 'ESRCH'
+  }
+}
+
+/** `<plugins>/marketplaces` — the marketplace cache root. */
+function getMarketplacesDirForCleanup(): string {
+  return join(getPluginsDirectory(), 'marketplaces')
+}
+
+/**
+ * Remove `.marketplace-add-<pid>-<uuid>.staging` directories left behind by
+ * interrupted marketplace installs (31 MB across four of them on the machine
+ * this was measured on).
+ *
+ * Both guards must hold, and they are an AND, not an OR: the directory must be
+ * older than an hour *and* the pid in its name must be gone. The age alone
+ * would race a slow clone; the dead pid alone would race pid reuse.
+ */
+export async function cleanupStaleMarketplaceStagingDirs(): Promise<CleanupResult> {
+  const result: CleanupResult = { messages: 0, errors: 0 }
+  const fsImpl = getFsImplementation()
+  const marketplacesDir = getMarketplacesDirForCleanup()
+  const cutoffDate = new Date(Date.now() - ONE_HOUR_MS)
+
+  let dirents
+  try {
+    dirents = await fsImpl.readdir(marketplacesDir)
+  } catch {
+    return result
+  }
+
+  for (const dirent of dirents) {
+    if (!dirent.isDirectory()) continue
+    const match = MARKETPLACE_STAGING_DIR_NAME.exec(dirent.name)
+    if (!match) continue
+    if (isProcessAlive(Number(match[1]))) continue
+
+    const stagingPath = join(marketplacesDir, dirent.name)
+    try {
+      const stats = await fsImpl.stat(stagingPath)
+      if (stats.mtime >= cutoffDate) continue
+      await fsImpl.rm(stagingPath, { recursive: true, force: true })
+      result.messages++
+    } catch {
+      result.errors++
+    }
+  }
+
+  return result
+}
+
+/**
+ * Remove shell snapshots older than seven days from `~/.crabcode/shell-snapshots/`.
+ *
+ * `ShellSnapshot.ts` only ever writes there; nothing reclaims, so the directory
+ * grows one file per session forever (219 on the measured machine). The writer
+ * is deliberately left alone — reclamation lives here with every other retention
+ * rule. A snapshot that a still-running shell would have sourced is safe to lose:
+ * `bashProvider` re-checks the path with `access()` and falls back to a login
+ * shell when it has gone.
+ */
+export async function cleanupOldShellSnapshots(): Promise<CleanupResult> {
+  const result: CleanupResult = { messages: 0, errors: 0 }
+  const fsImpl = getFsImplementation()
+  const snapshotsDir = join(getCrabCodeConfigHomeDir(), 'shell-snapshots')
+  const cutoffDate = new Date(Date.now() - SHELL_SNAPSHOT_RETENTION_MS)
+
+  let dirents
+  try {
+    dirents = await fsImpl.readdir(snapshotsDir)
+  } catch {
+    return result
+  }
+
+  for (const dirent of dirents) {
+    if (!dirent.isFile() || !SHELL_SNAPSHOT_FILE_NAME.test(dirent.name)) {
+      continue
+    }
+    try {
+      if (
+        await unlinkIfOld(join(snapshotsDir, dirent.name), cutoffDate, fsImpl)
+      ) {
+        result.messages++
+      }
+    } catch {
+      result.errors++
+    }
+  }
+
+  // Intentionally do NOT remove snapshotsDir — live shells write into it.
+  return result
+}
+
+/**
+ * Remove marketplace directories no `known_marketplaces.json` entry points at.
+ *
+ * The one on the measured machine was 63 MB: a pre-generation-layout
+ * `crabcode-plugins-official/` still on disk after the registry moved to
+ * `crabcode-plugins-official-<generationId>/`.
+ *
+ * A registry that cannot be read is NOT a registry with no references — every
+ * read failure, parse failure, non-object shape, or entry missing the required
+ * `installLocation` string aborts the whole sweep with nothing deleted, rather
+ * than reporting every directory as unreferenced.
+ *
+ * Dot-prefixed entries are skipped outright, which is wider than the spec's
+ * `.staging` exclusion and deliberately so: an in-flight install's *unsuffixed*
+ * `.marketplace-add-<pid>-<uuid>` path is a live directory that no registry
+ * entry references yet.
+ */
+export async function cleanupOrphanedMarketplaceDirs(): Promise<CleanupResult> {
+  const result: CleanupResult = { messages: 0, errors: 0 }
+  const fsImpl = getFsImplementation()
+  const pluginsDir = getPluginsDirectory()
+  const marketplacesDir = getMarketplacesDirForCleanup()
+
+  let raw: string
+  try {
+    raw = await fsImpl.readFile(join(pluginsDir, 'known_marketplaces.json'), {
+      encoding: 'utf8',
+    })
+  } catch {
+    return result
+  }
+
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    return result
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    return result
+  }
+
+  const referenced = new Set<string>()
+  for (const entry of Object.values(parsed as Record<string, unknown>)) {
+    if (typeof entry !== 'object' || entry === null) return result
+    const location = (entry as { installLocation?: unknown }).installLocation
+    // `installLocation` is required by KnownMarketplaceSchema. An entry without
+    // one is a registry we do not understand, so we stop rather than guess.
+    if (typeof location !== 'string' || location.length === 0) return result
+
+    // Legacy entries stored relative paths, resolved against the plugins root.
+    const absolute = isAbsolute(location)
+      ? resolve(location)
+      : resolve(pluginsDir, location)
+    const segment = firstSegmentUnder(marketplacesDir, absolute)
+    if (segment !== null) {
+      referenced.add(normalizeEntryName(segment))
+    }
+    // A location resolving outside the marketplaces dir still shields a
+    // same-named directory inside it. Over-protecting keeps a stale directory;
+    // under-protecting deletes a live one.
+    referenced.add(normalizeEntryName(basename(absolute)))
+  }
+
+  let dirents
+  try {
+    dirents = await fsImpl.readdir(marketplacesDir)
+  } catch {
+    return result
+  }
+
+  for (const dirent of dirents) {
+    if (!dirent.isDirectory()) continue
+    if (dirent.name.startsWith('.') || dirent.name.endsWith('.staging')) {
+      continue
+    }
+    if (referenced.has(normalizeEntryName(dirent.name))) continue
+    try {
+      await fsImpl.rm(join(marketplacesDir, dirent.name), {
+        recursive: true,
+        force: true,
+      })
+      result.messages++
+    } catch {
+      result.errors++
+    }
+  }
+
+  return result
+}
+
+/**
+ * `$XDG_DATA_HOME/crabcode/versions`, byte-for-byte the directory
+ * `scripts/install.ps1` / `install.sh` and the Rust
+ * `native_installer_versions_dir()` install into.
+ */
+function getNativeInstallerVersionsDir(): string | null {
+  const dataHomeEnv = process.env.XDG_DATA_HOME
+  const dataHome =
+    dataHomeEnv && dataHomeEnv.length > 0
+      ? dataHomeEnv
+      : join(homedir(), '.local', 'share')
+  if (!isAbsolute(dataHome)) return null
+  return join(dataHome, 'crabcode', 'versions')
+}
+
+/**
+ * Remove installed version trees that are neither what `.current` names nor
+ * where this process is actually running from (244 MB of superseded 1.0.35 on
+ * the measured machine).
+ *
+ * "Where this process is running from" is derived from `process.execPath` — the
+ * release layout puts the running `bun` inside the version directory — and NOT
+ * from `.current`, which is exactly the file that can be stale or wrong. Both
+ * answers are computed independently and both are kept.
+ *
+ * Every uncertainty aborts the whole sweep with nothing deleted:
+ *   - the versions dir cannot be realpath'd (no native install here);
+ *   - `process.execPath` does not resolve to somewhere below the versions dir
+ *     (a dev/npm run — this process has no version directory to protect, so no
+ *     directory may be deleted either);
+ *   - `.current` is missing, empty, relative, unresolvable, or points outside
+ *     the versions tree.
+ *
+ * Dot-prefixed entries (`.current`, `.launcher-v1`, `.install-<v>-<uuid>`
+ * incoming trees) are installer-owned and never touched.
+ *
+ * @param options.versionsDir Override the versions root (tests).
+ * @param options.execPath Override the running executable (tests).
+ */
+export async function cleanupSupersededInstallVersions(options?: {
+  versionsDir?: string
+  execPath?: string
+}): Promise<CleanupResult> {
+  const result: CleanupResult = { messages: 0, errors: 0 }
+  const fsImpl = getFsImplementation()
+  const versionsDir = options?.versionsDir ?? getNativeInstallerVersionsDir()
+  if (versionsDir === null) return result
+
+  let versionsRoot: string
+  let execPathReal: string
+  try {
+    versionsRoot = fsImpl.realpathSync(versionsDir)
+    execPathReal = fsImpl.realpathSync(options?.execPath ?? process.execPath)
+  } catch {
+    return result
+  }
+
+  const runningVersion = firstSegmentUnder(versionsRoot, execPathReal)
+  if (runningVersion === null) return result
+
+  let declared: string
+  try {
+    declared = (
+      await fsImpl.readFile(join(versionsRoot, '.current'), {
+        encoding: 'utf8',
+      })
+    ).trim()
+  } catch {
+    return result
+  }
+  if (declared.length === 0 || !isAbsolute(declared)) return result
+
+  let declaredVersion: string | null
+  try {
+    declaredVersion = firstSegmentUnder(
+      versionsRoot,
+      fsImpl.realpathSync(declared),
+    )
+  } catch {
+    // `.current` names a directory we cannot resolve. We no longer know which
+    // entry it protects, so we protect all of them.
+    return result
+  }
+  if (declaredVersion === null) return result
+
+  const keep = new Set([
+    normalizeEntryName(runningVersion),
+    normalizeEntryName(declaredVersion),
+  ])
+
+  let dirents
+  try {
+    dirents = await fsImpl.readdir(versionsRoot)
+  } catch {
+    return result
+  }
+
+  for (const dirent of dirents) {
+    if (!dirent.isDirectory()) continue
+    if (dirent.name.startsWith('.')) continue
+    if (keep.has(normalizeEntryName(dirent.name))) continue
+    try {
+      await fsImpl.rm(join(versionsRoot, dirent.name), {
+        recursive: true,
+        force: true,
+      })
+      result.messages++
+    } catch {
+      result.errors++
+    }
+  }
+
+  return result
+}
+
 const ONE_DAY_MS = 24 * 60 * 60 * 1000
 
 /**
@@ -553,6 +918,10 @@ async function cleanupOldMessageFilesCore(): Promise<void> {
   await cleanupOldDebugLogs()
   await cleanupOldImageCaches()
   await cleanupOldPastes(getCutoffDate())
+  await cleanupStaleMarketplaceStagingDirs()
+  await cleanupOldShellSnapshots()
+  await cleanupOrphanedMarketplaceDirs()
+  await cleanupSupersededInstallVersions()
   const removedWorktrees = await cleanupStaleAgentWorktrees(getCutoffDate())
   if (removedWorktrees > 0) {
     logEvent('tengu_worktree_cleanup', { removed: removedWorktrees })
@@ -562,10 +931,17 @@ async function cleanupOldMessageFilesCore(): Promise<void> {
 /**
  * Renderer- and server-free cleanup used by the dedicated native TUI.
  *
- * Native-generation cleanup belongs to its release installer/supervisor and
- * ant npm-cache cleanup is an internal distribution concern. User-owned
- * transcript, plan, file-history, media, paste and stale worktree retention
- * stays identical.
+ * Ant npm-cache cleanup is an internal distribution concern and stays out.
+ * User-owned transcript, plan, file-history, media, paste and stale worktree
+ * retention stays identical.
+ *
+ * Superseded native generations ARE reclaimed here (P2-10): the installer only
+ * ever adds a version tree, so nothing else was ever going to remove the one
+ * an update left behind. `cleanupSupersededInstallVersions` self-limits to
+ * processes actually running out of the versions tree, so this call is inert
+ * for dev and npm runs. It reaches this far only after startup succeeded and
+ * `initializeVersionedPlugins()` completed — `startDirectTuiBackendLifecycle`
+ * is called after both, and defers this whole body behind an idle timer.
  */
 export async function cleanupDirectTuiUserDataInBackground(): Promise<void> {
   await cleanupOldMessageFilesCore()

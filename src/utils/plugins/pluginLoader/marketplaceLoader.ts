@@ -31,8 +31,8 @@ import {
   isSourceInBlocklist,
 } from '../marketplaceHelpers.js'
 import {
-  getPluginByIdCacheOnly,
   loadKnownMarketplacesConfigSafe,
+  resolveMarketplacePluginsCacheOnly,
 } from '../marketplaceManager.js'
 import { parsePluginIdentifier } from '../pluginIdentifier.js'
 import {
@@ -112,54 +112,82 @@ export async function loadPluginsFromMarketplaces({
   // Look up installed versions once
   const installedPluginsData = getInMemoryInstalledPlugins()
 
+  // Enterprise policy is decided before any catalog read so blocked ids never
+  // reach the marketplace lock at all.
+  const admitted: Array<[string, unknown]> = []
+  for (const [pluginId, enabledValue] of marketplacePluginEntries) {
+    const { name: pluginName, marketplace: marketplaceName } =
+      parsePluginIdentifier(pluginId)
+
+    const marketplaceConfig = knownMarketplaces[marketplaceName!]
+
+    // Fail-closed: enterprise policy active but can't verify source
+    if (!marketplaceConfig && hasEnterprisePolicy) {
+      errors.push({
+        type: 'marketplace-blocked-by-policy',
+        source: pluginId,
+        plugin: pluginName,
+        marketplace: marketplaceName!,
+        blockedByBlocklist: strictAllowlist === null,
+        allowedSources: (strictAllowlist ?? []).map((s) =>
+          formatSourceForDisplay(s),
+        ),
+      })
+      continue
+    }
+
+    if (
+      marketplaceConfig &&
+      !isSourceAllowedByPolicy(marketplaceConfig.source)
+    ) {
+      const isBlocked = isSourceInBlocklist(marketplaceConfig.source)
+      const allowlist = getStrictKnownMarketplaces() || []
+      errors.push({
+        type: 'marketplace-blocked-by-policy',
+        source: pluginId,
+        plugin: pluginName,
+        marketplace: marketplaceName!,
+        blockedByBlocklist: isBlocked,
+        allowedSources: isBlocked
+          ? []
+          : allowlist.map((s) => formatSourceForDisplay(s)),
+      })
+      continue
+    }
+
+    admitted.push([pluginId, enabledValue])
+  }
+
+  // Installation identity must come from one registry-locked catalog read.
+  // Never combine the preloaded catalog with a separately loaded registry
+  // entry: refresh can change generation/location between those snapshots.
+  //
+  // The whole batch resolves under a single lock acquisition. A contended
+  // lock throws MarketplaceCatalogUnavailableError, which deliberately
+  // propagates: the caller retries the pass rather than publishing a catalog
+  // with the unresolved plugins silently missing.
+  const resolutions = await resolveMarketplacePluginsCacheOnly(
+    admitted.map(([pluginId]) => pluginId),
+  )
+
   // Load all marketplace plugins in parallel for faster startup
   const results = await Promise.allSettled(
-    marketplacePluginEntries.map(async ([pluginId, enabledValue]) => {
+    admitted.map(async ([pluginId, enabledValue]) => {
       const { name: pluginName, marketplace: marketplaceName } =
         parsePluginIdentifier(pluginId)
+      const resolution = resolutions.get(pluginId)
 
-      const marketplaceConfig = knownMarketplaces[marketplaceName!]
-
-      // Fail-closed: enterprise policy active but can't verify source
-      if (!marketplaceConfig && hasEnterprisePolicy) {
+      if (resolution?.status === 'marketplace-unreadable') {
         errors.push({
-          type: 'marketplace-blocked-by-policy',
+          type: 'marketplace-load-failed',
           source: pluginId,
-          plugin: pluginName,
-          marketplace: marketplaceName!,
-          blockedByBlocklist: strictAllowlist === null,
-          allowedSources: (strictAllowlist ?? []).map((s) =>
-            formatSourceForDisplay(s),
-          ),
+          marketplace: resolution.marketplace,
+          reason: resolution.reason,
         })
         return null
       }
 
-      if (
-        marketplaceConfig &&
-        !isSourceAllowedByPolicy(marketplaceConfig.source)
-      ) {
-        const isBlocked = isSourceInBlocklist(marketplaceConfig.source)
-        const allowlist = getStrictKnownMarketplaces() || []
-        errors.push({
-          type: 'marketplace-blocked-by-policy',
-          source: pluginId,
-          plugin: pluginName,
-          marketplace: marketplaceName!,
-          blockedByBlocklist: isBlocked,
-          allowedSources: isBlocked
-            ? []
-            : allowlist.map((s) => formatSourceForDisplay(s)),
-        })
-        return null
-      }
-
-      // Installation identity must come from one registry-locked catalog read.
-      // Never combine the preloaded catalog with a separately loaded registry
-      // entry: refresh can change generation/location between those snapshots.
-      const result = await getPluginByIdCacheOnly(pluginId)
-
-      if (!result) {
+      if (resolution?.status !== 'resolved') {
         errors.push({
           type: 'plugin-not-found',
           source: pluginId,
@@ -183,7 +211,7 @@ export async function loadPluginsFromMarketplaces({
       // coordinated startup/install path; loading must never create or
       // overwrite deterministic cache paths as a side effect.
       return loadPluginFromMarketplaceEntryCacheOnly(
-        result.entry,
+        resolution.plugin.entry,
         pluginId,
         enabledValue === true,
         errors,
@@ -198,7 +226,7 @@ export async function loadPluginsFromMarketplaces({
     } else if (result.status === 'rejected') {
       const err = toError(result.reason)
       logError(err)
-      const pluginId = marketplacePluginEntries[i]![0]
+      const pluginId = admitted[i]![0]
       errors.push({
         type: 'generic-error',
         source: pluginId,

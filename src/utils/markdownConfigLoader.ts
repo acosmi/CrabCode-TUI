@@ -550,6 +550,24 @@ async function loadMarkdownFiles(dir: string): Promise<
     content: string
   }[]
 > {
+  // Skip the search entirely when the target isn't a directory. Most config
+  // dirs (managed policy dirs, ~/.crabcode/agents, ...) don't exist on a given
+  // machine, and each one still cost a full `rg` spawn that was guaranteed to
+  // fail — measured at ~1.3s of startup across three missing dirs on Windows,
+  // where every CreateProcess pays image load + Defender scan.
+  //
+  // This pre-check is a perf filter, not a correctness gate, so the TOCTOU
+  // window it opens is harmless: the catch below still handles the dir
+  // disappearing between this stat() and the spawn, which is the same race
+  // that exists with no pre-check at all. Two lines of defense, not one
+  // replacing the other. Same rationale as getProjectDirsUpToHome's filter.
+  try {
+    if (!(await stat(dir)).isDirectory()) return []
+  } catch (e: unknown) {
+    if (isFsInaccessible(e)) return []
+    throw e
+  }
+
   // File search strategy:
   // - Default: ripgrep (faster, battle-tested)
   // - Fallback: native Node.js (when CRABCODE_USE_NATIVE_FILE_SEARCH is set)
@@ -567,8 +585,8 @@ async function loadMarkdownFiles(dir: string): Promise<
           signal,
         )
   } catch (e: unknown) {
-    // Handle missing/inaccessible dir directly instead of pre-checking
-    // existence (TOCTOU). findMarkdownFilesNative already catches internally;
+    // Second line of defense: the dir can still vanish between the pre-check
+    // above and this call. findMarkdownFilesNative already catches internally;
     // ripGrep rejects on inaccessible target paths.
     if (isFsInaccessible(e)) return []
     throw e

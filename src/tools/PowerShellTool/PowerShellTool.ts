@@ -703,6 +703,24 @@ export const PowerShellTool = buildTool({
     return isOutputLineTruncated(output.stdout) || isOutputLineTruncated(output.stderr);
   }
 } satisfies ToolDef<InputSchema, Out>);
+/**
+ * `fullOutput` is a bounded tail window over the command's output, not a
+ * cumulative buffer (see BashProgress in src/types/tools.ts). On the
+ * interrupt-backgrounding path it is handed back as `stdout`, where a bare tail
+ * would read as the command's complete output.
+ *
+ * `lastTotalBytes` is non-zero exactly when the producer truncated the window,
+ * so label the tail in that case instead of presenting it as complete. The full
+ * text stays retrievable through the `backgroundTaskId` returned alongside it.
+ */
+function labelTruncatedTail(tail: string, totalBytes: number): string {
+  if (!totalBytes || !tail) {
+    return tail;
+  }
+  return `[output truncated: showing the last ${tail.length} of ${totalBytes} bytes written so far; retrieve the rest with the returned background task id]
+${tail}`;
+}
+
 async function* runPowerShellCommand({
   input,
   abortController,
@@ -965,7 +983,9 @@ async function* runPowerShellCommand({
       // Check if command was backgrounded (by timeout or interrupt)
       if (backgroundShellId) {
         return {
-          stdout: interruptBackgroundingStarted ? fullOutput : '',
+          stdout: interruptBackgroundingStarted
+            ? labelTruncatedTail(fullOutput, lastTotalBytes)
+            : '',
           stderr: '',
           code: 0,
           interrupted: false,

@@ -213,6 +213,12 @@ export class DirectTuiCommandCatalogLifecycle<TCommand> {
  * acknowledging an earlier snapshot. Keeping one in-flight request and one
  * replaceable pending snapshot prevents stale completion from winning while
  * preserving StructuredIO's sole outbound FIFO.
+ *
+ * Producers re-project the whole catalog on every change, so most background
+ * refreshes carry a snapshot Rust already holds. Rust replaces its entire
+ * command model on receipt, so republishing an identical snapshot reshuffles
+ * the palette under the user's cursor for no reason. Serialized snapshots are
+ * compared and an unchanged one is dropped without scheduling a drain.
  */
 export class DirectTuiCommandCatalogPublisher {
   private ready = false
@@ -220,6 +226,9 @@ export class DirectTuiCommandCatalogPublisher {
   private holdCount = 0
   private dirty = false
   private latest: readonly CommandCatalogEntry[] = []
+  private latestSerialized: string | undefined
+  private inFlightSerialized: string | undefined
+  private lastDeliveredSerialized: string | undefined
   private drainPromise: Promise<void> | undefined
 
   constructor(
@@ -229,9 +238,25 @@ export class DirectTuiCommandCatalogPublisher {
 
   update(commands: readonly CommandCatalogEntry[]): void {
     if (this.closed) return
+    const serialized = JSON.stringify(commands)
+    if (serialized === this.publishedOrScheduledSerialized()) return
     this.latest = commands.map(command => ({ ...command }))
+    this.latestSerialized = serialized
     this.dirty = true
     this.startDrain()
+  }
+
+  /**
+   * The snapshot Rust ends up holding once the publisher goes idle.
+   *
+   * A pending snapshot supersedes an in-flight one, and an in-flight one
+   * supersedes the last acknowledged one. Comparing against the last
+   * acknowledged snapshot alone would drop an update that reverts an
+   * in-flight change and leave Rust holding the superseded catalog.
+   */
+  private publishedOrScheduledSerialized(): string | undefined {
+    if (this.dirty) return this.latestSerialized
+    return this.inFlightSerialized ?? this.lastDeliveredSerialized
   }
 
   markInitialized(): void {
@@ -297,9 +322,17 @@ export class DirectTuiCommandCatalogPublisher {
     while (this.ready && !this.closed && this.dirty) {
       this.dirty = false
       const snapshot = this.latest
+      const serialized = this.latestSerialized
+      this.inFlightSerialized = serialized
       try {
         await this.send(snapshot)
+        // Only an acknowledged snapshot may suppress a later identical one; a
+        // failed transport leaves Rust on the previous catalog, so the same
+        // snapshot must still be resendable.
+        this.lastDeliveredSerialized = serialized
+        this.inFlightSerialized = undefined
       } catch (error) {
+        this.inFlightSerialized = undefined
         try {
           this.onError(error)
         } catch {
