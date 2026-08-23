@@ -585,11 +585,22 @@ async function loadMarkdownFiles(dir: string): Promise<
           signal,
         )
   } catch (e: unknown) {
-    // Second line of defense: the dir can still vanish between the pre-check
-    // above and this call. findMarkdownFilesNative already catches internally;
-    // ripGrep rejects on inaccessible target paths.
-    if (isFsInaccessible(e)) return []
-    throw e
+    if (!isFsInaccessible(e)) throw e
+
+    // `ENOENT` is ambiguous here: it can mean the target vanished after the
+    // pre-check, or that the ripgrep executable itself is unavailable. Falling
+    // back to the native walker preserves both cases without guessing which
+    // path caused the error. A vanished/inaccessible target still produces [],
+    // while an existing directory continues to load correctly on source/dev
+    // installations that do not ship or install `rg`.
+    if (!useNative) {
+      logForDebugging(
+        `Ripgrep could not search ${dir}; falling back to native markdown discovery`,
+      )
+      files = await findMarkdownFilesNative(dir, signal)
+    } else {
+      return []
+    }
   }
 
   const results = await Promise.all(

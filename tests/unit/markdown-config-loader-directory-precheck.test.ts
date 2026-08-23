@@ -162,4 +162,33 @@ describe('loadMarkdownFiles directory pre-check (P1-7)', () => {
       spy.mockRestore()
     }
   })
+
+  test('falls back to native discovery when the ripgrep executable is missing', async () => {
+    const { configHome, cwd } = isolate('md-precheck-rg-missing')
+    const userDir = join(configHome, 'output-styles')
+    const filePath = join(userDir, 'concise.md')
+    mkdirSync(userDir, { recursive: true })
+    writeFileSync(filePath, '# concise\n', 'utf-8')
+
+    const spy = spyOn(ripgrepModule, 'ripGrep').mockImplementation(
+      async (_args, target) => {
+        if (target === userDir) {
+          throw Object.assign(new Error('spawn rg ENOENT'), {
+            code: 'ENOENT',
+            path: 'rg',
+          })
+        }
+        return []
+      },
+    )
+    try {
+      const files = await loadMarkdownFilesForSubdir('output-styles', cwd)
+      expect(targetsOf(spy)).toContain(userDir)
+      expect(files.map(file => file.filePath)).toEqual([filePath])
+      expect(files[0]?.content.trim()).toBe('# concise')
+      expect(files[0]?.source).toBe('userSettings')
+    } finally {
+      spy.mockRestore()
+    }
+  })
 })
