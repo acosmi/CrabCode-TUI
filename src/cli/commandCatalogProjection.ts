@@ -60,9 +60,25 @@ export function projectCommandCatalogEntries(
  * second stale token list.
  *
  * The backend resolves slash invocations with `Array.find`, so the first
- * command whose actual routable name matches a token owns that token. Preserve
- * that order here: canonical name first, declared aliases next, then the
- * historical user-facing fallback where the dispatcher still supports it.
+ * command whose actual routable name matches a token owns that token. Token
+ * ownership is still claimed in that exact order: canonical name first,
+ * declared aliases next, then the historical user-facing fallback where the
+ * dispatcher still supports it.
+ *
+ * Each command contributes exactly one discoverable row: its first publishable
+ * invocation. Every further row for the same command is an alternate spelling
+ * of one command, so it is published as `hidden` — the renderer keeps routing
+ * it verbatim, but stops listing `/clear`, `/reset`, and `/new` as three
+ * separate commands. Normally that first row is the canonical name; when an
+ * earlier first-wins owner already claimed the canonical token, the command's
+ * first surviving alias takes the visible row, because the goal is to remove
+ * duplicate rows, never to remove a command from discovery entirely.
+ *
+ * Entries are returned sorted by name in UTF-16 code-unit order. The registry
+ * arrives in whatever order concurrent discovery loads settled in, and an
+ * unordered catalog made every reload look like a content change and reshuffle
+ * the renderer's palette. Ordering is presentation only; ownership above is
+ * unaffected because each token is claimed exactly once.
  *
  * Callers pass an already stable-name-deduplicated command list. Model-only
  * commands remain undiscoverable, but still claim their backend-owned tokens
@@ -80,6 +96,11 @@ export function projectDirectTuiCommandCatalogEntries(
     let presentation:
       | { description: string; argumentHint: string }
       | undefined
+    // Rows this command actually contributed, not positions in the routable
+    // sequence: a token dropped as already-claimed, unparsable, overlong, or
+    // malformed never had a row, so it must not consume this command's one
+    // discoverable slot and make the command vanish from the palette.
+    let publishedRowCount = 0
     const invocationNames = getRoutableCommandInvocationNames(command)
     while (true) {
       let nextName: IteratorResult<string>
@@ -114,7 +135,7 @@ export function projectDirectTuiCommandCatalogEntries(
       }
       if (!isWellFormedUtf16(name)) continue
       if (entries.length >= DIRECT_TUI_COMMAND_CATALOG_MAX_ENTRIES) {
-        return entries
+        return sortCatalogEntriesByName(entries)
       }
       // Presentation metadata is not routing identity, so it can be safely
       // bounded to the closed direct-TUI wire contract. Plugin/frontmatter
@@ -145,13 +166,33 @@ export function projectDirectTuiCommandCatalogEntries(
         name,
         description: presentation.description,
         argumentHint: presentation.argumentHint,
-        ...(command.isHidden === true ? { hidden: true as const } : {}),
+        ...(command.isHidden === true || publishedRowCount > 0
+          ? { hidden: true as const }
+          : {}),
         ...(builtInNames.has(name) ? { builtin: true as const } : {}),
       })
+      publishedRowCount += 1
     }
   }
 
-  return entries
+  return sortCatalogEntriesByName(entries)
+}
+
+/**
+ * Order the closed catalog by UTF-16 code-unit comparison.
+ *
+ * `localeCompare` is deliberately unused: its result depends on the host ICU
+ * data and the active locale, so it cannot give the renderer a byte-stable
+ * snapshot across machines or across a locale change inside one session.
+ */
+function sortCatalogEntriesByName(
+  entries: CommandCatalogEntry[],
+): CommandCatalogEntry[] {
+  return entries.sort((left, right) => {
+    if (left.name < right.name) return -1
+    if (left.name > right.name) return 1
+    return 0
+  })
 }
 
 export function isWellFormedUtf16(value: string): boolean {

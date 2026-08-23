@@ -407,6 +407,153 @@ describe('direct TUI command catalog refresh private contract', () => {
     expect(sends).toEqual([['before-b'], ['during-latest']])
   })
 
+  test('drops a re-projected snapshot that only differs in discovery order', async () => {
+    const sends: string[][] = []
+    const publisher = new DirectTuiCommandCatalogPublisher(
+      async commands => {
+        sends.push(commands.map(entry => entry.name))
+      },
+      error => {
+        throw error
+      },
+    )
+    const command = (name: string, aliases?: string[]) =>
+      ({
+        type: 'local',
+        name,
+        description: `${name} description`,
+        aliases,
+      }) as unknown as Command
+    const project = (commands: readonly Command[]) =>
+      projectCommandCatalogEntries(commands, item => item.description)
+    // The same registry, loaded in the order two concurrent discovery passes
+    // happened to settle in.
+    const firstLoadOrder = [
+      command('clear', ['reset', 'new']),
+      command('compact', ['com']),
+      command('review'),
+    ]
+    const secondLoadOrder = [
+      command('review'),
+      command('clear', ['reset', 'new']),
+      command('compact', ['com']),
+    ]
+    const delivered = ['clear', 'com', 'compact', 'new', 'reset', 'review']
+
+    publisher.markInitialized()
+    publisher.update(project(firstLoadOrder))
+    await publisher.whenIdle()
+    expect(sends).toEqual([delivered])
+
+    publisher.update(project(secondLoadOrder))
+    await publisher.whenIdle()
+    expect(sends).toEqual([delivered])
+
+    publisher.update(project([...secondLoadOrder, command('added')]))
+    await publisher.whenIdle()
+    expect(sends).toEqual([delivered, ['added', ...delivered]])
+  })
+
+  test('republishes only when the delivered catalog content really changed', async () => {
+    const sends: Array<Array<[string, string]>> = []
+    const publisher = new DirectTuiCommandCatalogPublisher(
+      async commands => {
+        sends.push(
+          commands.map(entry => [entry.name, entry.description] as [
+            string,
+            string,
+          ]),
+        )
+      },
+      error => {
+        throw error
+      },
+    )
+    const entry = (name: string, description = name) => ({
+      name,
+      description,
+      argumentHint: '',
+    })
+
+    publisher.markInitialized()
+    publisher.update([entry('alpha'), entry('beta')])
+    await publisher.whenIdle()
+    expect(sends).toEqual([
+      [
+        ['alpha', 'alpha'],
+        ['beta', 'beta'],
+      ],
+    ])
+
+    // A structurally equal snapshot from a fresh projection is not a change.
+    publisher.update([entry('alpha'), entry('beta')])
+    await publisher.whenIdle()
+    expect(sends).toHaveLength(1)
+
+    // Presentation-only differences are still real catalog changes.
+    publisher.update([entry('alpha'), entry('beta', 'beta rewritten')])
+    await publisher.whenIdle()
+    expect(sends).toEqual([
+      [
+        ['alpha', 'alpha'],
+        ['beta', 'beta'],
+      ],
+      [
+        ['alpha', 'alpha'],
+        ['beta', 'beta rewritten'],
+      ],
+    ])
+  })
+
+  test('still publishes a revert that races an unacknowledged snapshot', async () => {
+    const sends: string[][] = []
+    const releases: Array<() => void> = []
+    const publisher = new DirectTuiCommandCatalogPublisher(
+      commands => {
+        sends.push(commands.map(entry => entry.name))
+        return new Promise<void>(resolve => releases.push(resolve))
+      },
+      error => {
+        throw error
+      },
+    )
+    const entry = (name: string) => ({
+      name,
+      description: name,
+      argumentHint: '',
+    })
+    const settleMicrotasks = async () => {
+      for (let turn = 0; turn < 8; turn += 1) await Promise.resolve()
+    }
+
+    publisher.markInitialized()
+    publisher.update([entry('installed')])
+    await settleMicrotasks()
+    expect(sends).toEqual([['installed']])
+    releases.shift()?.()
+    await settleMicrotasks()
+
+    publisher.update([entry('uninstalled')])
+    await settleMicrotasks()
+    expect(sends).toEqual([['installed'], ['uninstalled']])
+
+    // The reinstall lands while the uninstall is still unacknowledged; the
+    // last delivered snapshot alone would wrongly suppress it and leave Rust
+    // holding the superseded catalog.
+    publisher.update([entry('installed')])
+    releases.shift()?.()
+    await settleMicrotasks()
+    expect(sends).toEqual([
+      ['installed'],
+      ['uninstalled'],
+      ['installed'],
+    ])
+
+    releases.shift()?.()
+    await publisher.whenIdle()
+    expect(sends).toHaveLength(3)
+  })
+
   test('queues an owning auth response before its follow-up reverse refresh', async () => {
     const order: string[] = []
     const publisher = new DirectTuiCommandCatalogPublisher(

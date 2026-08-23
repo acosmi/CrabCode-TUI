@@ -60,6 +60,9 @@ describe('slash-command control catalog projection', () => {
     ).toEqual(['shared', 'visible-alias'])
   })
 
+  // Name pinned by contracts/direct-tui-command-capabilities/v1 evidence
+  // marker ts.catalog_projection: keep it verbatim. "First-wins order" is the
+  // token-ownership order the projection resolves; rows are delivered sorted.
   test('projects canonical names and aliases in backend first-wins order', () => {
     const entries = projectCommandCatalogEntries(
       [
@@ -85,16 +88,14 @@ describe('slash-command control catalog projection', () => {
         argumentHint: '<alpha>',
       },
       {
-        name: 'shared',
-        description: 'formatted: alpha description',
-        argumentHint: '<alpha>',
-      },
-      {
         name: 'alpha-alias',
         description: 'formatted: alpha description',
         argumentHint: '<alpha>',
+        hidden: true,
       },
       {
+        // `shared` lost its canonical token to `alpha`, so this alias is the
+        // command's first published row and stays discoverable.
         name: 'beta-alias',
         description: 'formatted: shared description',
         argumentHint: '<beta>',
@@ -108,8 +109,133 @@ describe('slash-command control catalog projection', () => {
         name: 'gamma-alias',
         description: 'formatted: gamma description',
         argumentHint: '',
+        hidden: true,
+      },
+      {
+        name: 'shared',
+        description: 'formatted: alpha description',
+        argumentHint: '<alpha>',
+        hidden: true,
       },
     ])
+  })
+
+  test('publishes one discoverable row per command and hides alternate spellings', () => {
+    const entries = projectCommandCatalogEntries(
+      [
+        command('clear', { aliases: ['reset', 'new'] }),
+        command('compact', { aliases: ['com'] }),
+      ],
+      item => item.description,
+    )
+
+    expect(entries).toEqual([
+      {
+        name: 'clear',
+        description: 'clear description',
+        argumentHint: '',
+      },
+      {
+        name: 'com',
+        description: 'compact description',
+        argumentHint: '',
+        hidden: true,
+      },
+      {
+        name: 'compact',
+        description: 'compact description',
+        argumentHint: '',
+      },
+      {
+        name: 'new',
+        description: 'clear description',
+        argumentHint: '',
+        hidden: true,
+      },
+      {
+        name: 'reset',
+        description: 'clear description',
+        argumentHint: '',
+        hidden: true,
+      },
+    ])
+    expect(entries.filter(entry => entry.hidden !== true)).toHaveLength(2)
+    // Every hidden alias still routes to its owner, so typing it keeps working.
+    for (const entry of entries) {
+      expect(
+        findCommand(entry.name, [
+          command('clear', { aliases: ['reset', 'new'] }),
+          command('compact', { aliases: ['com'] }),
+        ])?.description,
+        entry.name,
+      ).toBe(entry.description)
+    }
+  })
+
+  test('keeps the canonical row hidden when the command itself is hidden', () => {
+    const entries = projectCommandCatalogEntries(
+      [command('secret', { aliases: ['secret-alias'], isHidden: true })],
+      item => item.description,
+    )
+
+    expect(entries).toEqual([
+      {
+        name: 'secret',
+        description: 'secret description',
+        argumentHint: '',
+        hidden: true,
+      },
+      {
+        name: 'secret-alias',
+        description: 'secret description',
+        argumentHint: '',
+        hidden: true,
+      },
+    ])
+  })
+
+  test('projects one identical array for any input order of the same commands', () => {
+    const commands = [
+      command('zulu', { aliases: ['zulu-alias'] }),
+      command('alpha', { aliases: ['alpha-alias'], argumentHint: '<a>' }),
+      command('mike'),
+      command('bravo', { aliases: ['bravo-alias', 'bravo-second'] }),
+      command('yankee', { userFacingName: () => 'yankee-legacy' }),
+    ]
+    const project = (order: readonly Command[]) =>
+      projectCommandCatalogEntries(order, item => item.description)
+    const reference = project(commands)
+
+    expect(reference.map(entry => entry.name)).toEqual([
+      'alpha',
+      'alpha-alias',
+      'bravo',
+      'bravo-alias',
+      'bravo-second',
+      'mike',
+      'yankee',
+      'yankee-legacy',
+      'zulu',
+      'zulu-alias',
+    ])
+    // Every rotation and the full reversal of a collision-free registry must
+    // serialize to the same bytes; discovery settles in a nondeterministic
+    // order and the renderer replaces its whole model on any difference.
+    for (let rotation = 1; rotation < commands.length; rotation += 1) {
+      const rotated = [
+        ...commands.slice(rotation),
+        ...commands.slice(0, rotation),
+      ]
+      expect(project(rotated), `rotation ${rotation}`).toEqual(reference)
+      expect(
+        JSON.stringify(project(rotated)),
+        `rotation ${rotation} serialization`,
+      ).toBe(JSON.stringify(reference))
+    }
+    expect(project([...commands].reverse())).toEqual(reference)
+    expect(JSON.stringify(project([...commands].reverse()))).toBe(
+      JSON.stringify(reference),
+    )
   })
 
   test('lets model-only commands claim backend tokens without advertising them', () => {
@@ -124,7 +250,17 @@ describe('slash-command control catalog projection', () => {
       item => item.description,
     )
 
-    expect(entries.map(entry => entry.name)).toEqual(['visible-alias'])
+    // Losing the canonical token to an earlier owner does not make this
+    // command undiscoverable: `visible-alias` is its only publishable row, so
+    // it is the visible one. Collapsing duplicates must never delete a command
+    // from the palette.
+    expect(entries).toEqual([
+      {
+        name: 'visible-alias',
+        description: 'shared description',
+        argumentHint: '',
+      },
+    ])
     expect(
       findCommand('shared', [
         command('model-only', {
@@ -134,6 +270,39 @@ describe('slash-command control catalog projection', () => {
         command('shared', { aliases: ['visible-alias'] }),
       ])?.name,
     ).toBe('model-only')
+  })
+
+  test('gives a command whose canonical token was claimed its one visible row', () => {
+    const entries = projectCommandCatalogEntries(
+      [
+        command('token-owner', {
+          aliases: ['claimed-canonical'],
+          userInvocable: false,
+        }),
+        command('claimed-canonical', {
+          aliases: ['first-surviving-alias', 'second-surviving-alias'],
+        }),
+      ],
+      item => item.description,
+    )
+
+    // Hidden marks the *duplicate* spellings of a command, counted over the
+    // rows the command actually published. The dropped canonical row must not
+    // consume the visible slot, or this command would have zero rows.
+    expect(entries).toEqual([
+      {
+        name: 'first-surviving-alias',
+        description: 'claimed-canonical description',
+        argumentHint: '',
+      },
+      {
+        name: 'second-surviving-alias',
+        description: 'claimed-canonical description',
+        argumentHint: '',
+        hidden: true,
+      },
+    ])
+    expect(entries.filter(entry => entry.hidden !== true)).toHaveLength(1)
   })
 
   test('publishes only the legacy user-facing names that the dispatcher actually routes', () => {
@@ -151,11 +320,16 @@ describe('slash-command control catalog projection', () => {
     )
 
     expect(entries.map(entry => entry.name)).toEqual([
-      'stable-name',
       'documented-alias',
-      'localized-display-name',
       'interface-stable-name',
+      'localized-display-name',
+      'stable-name',
     ])
+    expect(
+      entries
+        .filter(entry => entry.hidden === true)
+        .map(entry => entry.name),
+    ).toEqual(['documented-alias', 'localized-display-name'])
     expect(findCommand('localized-display-name', [legacy])).toBe(legacy)
     expect(
       findCommand('display-only-name', [interfaceDisplay]),
@@ -191,11 +365,11 @@ describe('slash-command control catalog projection', () => {
     )
 
     expect(entries.map(entry => entry.name)).toEqual([
-      'visible-alias',
-      'legacy-owner',
       'display-collision',
+      'legacy-owner',
       'mcp__server__prompt',
       'server:prompt (MCP)',
+      'visible-alias',
     ])
     for (const entry of entries) {
       const owner = findCommand(entry.name, commands)
@@ -239,9 +413,9 @@ describe('slash-command control catalog projection', () => {
     )
 
     expect(entries.map(entry => entry.name)).toEqual([
-      'throwing-canonical',
-      'throwing-alias',
       'healthy-after-throw',
+      'throwing-alias',
+      'throwing-canonical',
     ])
     expect(displayCalls).toBe(1)
     expect(() =>
@@ -262,9 +436,9 @@ describe('slash-command control catalog projection', () => {
     )
 
     expect(entries.map(entry => entry.name)).toEqual([
+      'mcp:tool (MCP)',
       'valid',
       'valid-alias',
-      'mcp:tool (MCP)',
     ])
     expect(entries.every(entry => entry.name.trim().length > 0)).toBe(true)
   })
@@ -304,8 +478,8 @@ describe('slash-command control catalog projection', () => {
     )
 
     expect(entries.map(entry => entry.name)).toEqual([
-      'safe-canonical',
       'healthy-after-malformed-alias',
+      'safe-canonical',
     ])
   })
 
@@ -335,6 +509,10 @@ describe('slash-command control catalog projection', () => {
 
     expect(entries).toHaveLength(1)
     expect(entries[0]?.name).toBe('safe-alias')
+    // The canonical token was unrepresentable, so it never produced a row.
+    // The surviving alias is this command's first published row and must stay
+    // discoverable rather than hiding the command completely.
+    expect(entries[0]?.hidden).toBeUndefined()
     expect(entries[0]?.description.length).toBe(
       DIRECT_TUI_COMMAND_CATALOG_DESCRIPTION_MAX_UTF16_UNITS - 1,
     )
@@ -355,15 +533,25 @@ describe('slash-command control catalog projection', () => {
     )
 
     expect(entries).toHaveLength(DIRECT_TUI_COMMAND_CATALOG_MAX_ENTRIES)
-    expect(entries.at(-1)?.name).toBe(
-      `entry-${DIRECT_TUI_COMMAND_CATALOG_MAX_ENTRIES - 1}`,
-    )
     expect(
       entries.some(
         entry =>
-          entry.name === `entry-${DIRECT_TUI_COMMAND_CATALOG_MAX_ENTRIES}`,
+          entry.name === `entry-${DIRECT_TUI_COMMAND_CATALOG_MAX_ENTRIES - 1}`,
       ),
-    ).toBe(false)
+    ).toBe(true)
+    for (const overflow of [
+      DIRECT_TUI_COMMAND_CATALOG_MAX_ENTRIES,
+      DIRECT_TUI_COMMAND_CATALOG_MAX_ENTRIES + 1,
+    ]) {
+      expect(
+        entries.some(entry => entry.name === `entry-${overflow}`),
+        `entry-${overflow}`,
+      ).toBe(false)
+    }
+    // The capped snapshot is delivered in the same code-unit order as any
+    // other snapshot.
+    const names = entries.map(entry => entry.name)
+    expect(names).toEqual([...names].sort())
   })
 
   test('closes the real YAML array-hint path before initialize projection', () => {
@@ -417,14 +605,14 @@ describe('slash-command control catalog projection', () => {
 
       expect(entries).toEqual([
         {
-          name: 'builtin-command',
+          name: 'builtin-alias',
           description: 'builtin-command description',
           argumentHint: '',
           hidden: true,
           builtin: true,
         },
         {
-          name: 'builtin-alias',
+          name: 'builtin-command',
           description: 'builtin-command description',
           argumentHint: '',
           hidden: true,
@@ -481,6 +669,11 @@ describe('slash-command control catalog projection', () => {
 
     expect(entries).toEqual([
       {
+        name: 'healthy',
+        description: 'healthy description',
+        argumentHint: '',
+      },
+      {
         name: 'malformed-description',
         description: '',
         argumentHint: '',
@@ -488,11 +681,6 @@ describe('slash-command control catalog projection', () => {
       {
         name: 'throwing-description',
         description: '',
-        argumentHint: '',
-      },
-      {
-        name: 'healthy',
-        description: 'healthy description',
         argumentHint: '',
       },
     ])
