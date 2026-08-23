@@ -4576,14 +4576,6 @@ async function getMarketplaceUncached(
   throw new Error(`Marketplace '${name}' changed repeatedly while being loaded`)
 }
 
-/**
- * Get plugin by ID from cache only (no network calls).
- * Returns null if marketplace cache is missing or corrupted.
- * Use this for startup paths that should never block on network.
- *
- * @param pluginId - The plugin ID in format "name@marketplace"
- * @returns The plugin entry or null if not found/cache missing
- */
 export type ResolvedMarketplacePlugin = {
   entry: PluginMarketplaceEntry
   marketplaceInstallLocation: string
@@ -4591,71 +4583,231 @@ export type ResolvedMarketplacePlugin = {
   marketplaceContentDigest: string
 }
 
-export async function getPluginByIdCacheOnly(
-  pluginId: string,
-): Promise<ResolvedMarketplacePlugin | null> {
-  const { name: pluginName, marketplace: marketplaceName } =
-    parsePluginIdentifier(pluginId)
-  if (!pluginName || !marketplaceName) {
-    return null
+/**
+ * Marker carried by both the thrown error and the degraded loader diagnostic
+ * so the failure mode stays greppable end to end.
+ */
+export const MARKETPLACE_CATALOG_UNAVAILABLE = 'marketplace-unavailable'
+
+/**
+ * The marketplace catalog could not be read at all: the cross-process cache
+ * mutation lock or the registry transaction lock stayed contended for the
+ * whole retry budget.
+ *
+ * This is transient infrastructure contention, never evidence about a plugin.
+ * Callers must surface it as "catalog unavailable" and retry; downgrading it
+ * to "plugin not found" silently drops installed plugins (and their MCP
+ * servers) from the session.
+ */
+export class MarketplaceCatalogUnavailableError extends Error {
+  readonly code = MARKETPLACE_CATALOG_UNAVAILABLE
+  /** Marketplaces whose plugins could not be resolved because of this failure. */
+  readonly marketplaces: readonly string[]
+
+  constructor(marketplaces: readonly string[], sourceError: unknown) {
+    super(
+      `[${MARKETPLACE_CATALOG_UNAVAILABLE}] marketplace catalog could not be locked for reading: ${errorMessage(sourceError)}`,
+    )
+    this.name = 'MarketplaceCatalogUnavailableError'
+    this.marketplaces = [...marketplaces]
   }
+}
+
+/**
+ * Per-plugin outcome of a batched cache-only resolution.
+ *
+ * `not-found` is a real verdict about the catalog's contents (unparseable id,
+ * unregistered marketplace, or a marketplace that genuinely does not list the
+ * plugin). A catalog that could not be read is never reported this way — it is
+ * either `marketplace-unreadable` (decided under the lock, so not contention)
+ * or a thrown `MarketplaceCatalogUnavailableError`.
+ */
+export type MarketplacePluginResolution =
+  | { status: 'resolved'; plugin: ResolvedMarketplacePlugin }
+  | { status: 'not-found' }
+  | { status: 'marketplace-unreadable'; marketplace: string; reason: string }
+
+/**
+ * Resolve a whole batch of `name@marketplace` ids against the cached catalogs
+ * under ONE acquisition of the marketplace cache-mutation lock.
+ *
+ * Startup asks for every enabled plugin at once. Taking the global lock (and
+ * re-reading + re-digesting each ~100 KB `marketplace.json`) once per plugin
+ * turned a discovery pass into dozens of lock round-trips, which is exactly
+ * the traffic that starves a second CrabCode process out of the lock.
+ *
+ * @throws MarketplaceCatalogUnavailableError when the lock cannot be taken.
+ */
+export async function resolveMarketplacePluginsCacheOnly(
+  pluginIds: readonly string[],
+): Promise<Map<string, MarketplacePluginResolution>> {
+  const resolutions = new Map<string, MarketplacePluginResolution>()
+  const requestsByMarketplace = new Map<
+    string,
+    Array<{ pluginId: string; pluginName: string }>
+  >()
+
+  for (const pluginId of pluginIds) {
+    if (resolutions.has(pluginId)) continue
+    const { name: pluginName, marketplace: marketplaceName } =
+      parsePluginIdentifier(pluginId)
+    if (!pluginName || !marketplaceName) {
+      resolutions.set(pluginId, { status: 'not-found' })
+      continue
+    }
+    const bucket = requestsByMarketplace.get(marketplaceName)
+    const request = { pluginId, pluginName }
+    if (bucket) {
+      if (bucket.some((existing) => existing.pluginId === pluginId)) continue
+      bucket.push(request)
+    } else {
+      requestsByMarketplace.set(marketplaceName, [request])
+    }
+  }
+
+  // No marketplace-backed id in the batch: never pay a lock round-trip.
+  if (requestsByMarketplace.size === 0) return resolutions
 
   const context = captureMarketplaceCacheContext()
   try {
-    return await withMarketplaceCacheMutationLock(
+    await withMarketplaceCacheMutationLock(
       () =>
         withKnownMarketplacesTransaction(
           async (config) => {
-            const marketplaceConfig = config[marketplaceName]
-            if (!marketplaceConfig) {
-              return { value: null, changed: false }
-            }
-
-            const marketplace = await readCachedMarketplace(
-              marketplaceConfig.installLocation,
-              marketplaceConfig.source,
-              context.cacheDir,
-            )
-            const contentDigest = computeMarketplaceContentDigest(marketplace)
-            if (
-              marketplaceConfig.contentDigest !== undefined &&
-              marketplaceConfig.contentDigest !== contentDigest
-            ) {
-              throw new Error(
-                `Marketplace '${marketplaceName}' cached content does not match its registered generation`,
-              )
-            }
-
             let changed = false
-            if (
-              !marketplaceConfig.generationId ||
-              !marketplaceConfig.contentDigest
-            ) {
-              marketplaceConfig.generationId = randomUUID()
-              marketplaceConfig.contentDigest = contentDigest
-              changed = true
-            }
+            for (const [
+              marketplaceName,
+              requests,
+            ] of requestsByMarketplace.entries()) {
+              const marketplaceConfig = config[marketplaceName]
+              if (!marketplaceConfig) {
+                for (const request of requests) {
+                  resolutions.set(request.pluginId, { status: 'not-found' })
+                }
+                continue
+              }
 
-            const plugin = marketplace.plugins.find(
-              (candidate) => candidate.name === pluginName,
-            )
-            return {
-              value: plugin
-                ? {
-                    entry: plugin,
-                    marketplaceInstallLocation:
-                      marketplaceConfig.installLocation,
-                    marketplaceGenerationId: marketplaceConfig.generationId,
-                    marketplaceContentDigest: marketplaceConfig.contentDigest,
-                  }
-                : null,
-              changed,
+              let marketplace: PluginMarketplace
+              let contentDigest: string
+              try {
+                marketplace = await readCachedMarketplace(
+                  marketplaceConfig.installLocation,
+                  marketplaceConfig.source,
+                  context.cacheDir,
+                )
+                contentDigest = computeMarketplaceContentDigest(marketplace)
+                if (
+                  marketplaceConfig.contentDigest !== undefined &&
+                  marketplaceConfig.contentDigest !== contentDigest
+                ) {
+                  throw new Error(
+                    `Marketplace '${marketplaceName}' cached content does not match its registered generation`,
+                  )
+                }
+              } catch (error) {
+                // Decided while holding the lock, so no other process was
+                // mid-write: this is corruption/permission, not contention.
+                // Retrying cannot help, but it is still never a statement
+                // that the plugin is absent from the catalog.
+                const reason = errorMessage(error)
+                logForDebugging(
+                  `Cached marketplace '${marketplaceName}' could not be read: ${reason}`,
+                  { level: 'warn' },
+                )
+                for (const request of requests) {
+                  resolutions.set(request.pluginId, {
+                    status: 'marketplace-unreadable',
+                    marketplace: marketplaceName,
+                    reason,
+                  })
+                }
+                continue
+              }
+
+              let generationId = marketplaceConfig.generationId
+              let registeredDigest = marketplaceConfig.contentDigest
+              if (!generationId || !registeredDigest) {
+                generationId = randomUUID()
+                registeredDigest = contentDigest
+                marketplaceConfig.generationId = generationId
+                marketplaceConfig.contentDigest = registeredDigest
+                changed = true
+              }
+
+              // First entry wins, matching the previous `.find()` lookup.
+              const entriesByName = new Map<string, PluginMarketplaceEntry>()
+              for (const candidate of marketplace.plugins) {
+                if (!entriesByName.has(candidate.name)) {
+                  entriesByName.set(candidate.name, candidate)
+                }
+              }
+
+              for (const request of requests) {
+                const entry = entriesByName.get(request.pluginName)
+                resolutions.set(
+                  request.pluginId,
+                  entry
+                    ? {
+                        status: 'resolved',
+                        plugin: {
+                          entry,
+                          marketplaceInstallLocation:
+                            marketplaceConfig.installLocation,
+                          marketplaceGenerationId: generationId,
+                          marketplaceContentDigest: registeredDigest,
+                        },
+                      }
+                    : { status: 'not-found' },
+                )
+              }
             }
+            return { value: undefined, changed }
           },
           join(context.pluginsRoot, 'known_marketplaces.json'),
         ),
       context,
     )
+  } catch (error) {
+    // The transaction body above is total — every per-marketplace failure is
+    // recorded as a resolution. Anything escaping here is the lock/registry
+    // transaction itself failing, i.e. contention.
+    throw new MarketplaceCatalogUnavailableError(
+      [...requestsByMarketplace.keys()],
+      error,
+    )
+  }
+
+  return resolutions
+}
+
+/**
+ * Get plugin by ID from cache only (no network calls).
+ * Returns null if marketplace cache is missing or corrupted.
+ * Use this for startup paths that should never block on network.
+ *
+ * Single-element wrapper over `resolveMarketplacePluginsCacheOnly` so there is
+ * exactly one catalog-resolution implementation. Batch callers must use the
+ * batch entry point directly and honour the thrown unavailability instead of
+ * collapsing it to null.
+ *
+ * @param pluginId - The plugin ID in format "name@marketplace"
+ * @returns The plugin entry or null if not found/cache missing
+ */
+export async function getPluginByIdCacheOnly(
+  pluginId: string,
+): Promise<ResolvedMarketplacePlugin | null> {
+  try {
+    const resolution = (
+      await resolveMarketplacePluginsCacheOnly([pluginId])
+    ).get(pluginId)
+    if (resolution?.status === 'resolved') return resolution.plugin
+    if (resolution?.status === 'marketplace-unreadable') {
+      logForDebugging(
+        `Failed atomic marketplace plugin lookup for ${pluginId}: ${resolution.reason}`,
+        { level: 'warn' },
+      )
+    }
+    return null
   } catch (error) {
     logForDebugging(
       `Failed atomic marketplace plugin lookup for ${pluginId}: ${errorMessage(error)}`,

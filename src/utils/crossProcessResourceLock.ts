@@ -28,7 +28,19 @@ export type CrossProcessResourceLockOptions = {
 
 const LOCK_STALE_MS = 120_000
 const LOCK_UPDATE_MS = 10_000
-const ASYNC_LOCK_ATTEMPTS = 32
+/**
+ * 12 attempts with `retryDelayMs` = 25+50+100+200+200x7 = 1,775 ms of waiting
+ * before the acquisition is reported as contended.
+ *
+ * Every holder of these locks keeps its critical section to a bounded local
+ * read/commit measured in milliseconds — the marketplace catalog resolution
+ * that used to hold this lock 76 times per discovery pass now takes it once.
+ * A holder that is still not done after ~1.8 s is therefore not "about to
+ * finish"; it is blocked or dead, and the honest answer to the caller is a
+ * contention error it can retry deliberately, not another four seconds of
+ * blind sleeping inside the acquire loop.
+ */
+const ASYNC_LOCK_ATTEMPTS = 12
 const SYNC_LOCK_ATTEMPTS = 8
 
 const processTails = new Map<string, Promise<void>>()

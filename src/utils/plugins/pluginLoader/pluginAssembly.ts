@@ -28,6 +28,10 @@ import {
 } from '../../settings/settingsCache.js'
 import { verifyAndDemote } from '../dependencyResolver.js'
 import { getManagedPluginNames } from '../managedPlugins.js'
+import {
+  MARKETPLACE_CATALOG_UNAVAILABLE,
+  MarketplaceCatalogUnavailableError,
+} from '../marketplaceManager.js'
 import { PluginPathSecurityError } from '../pluginPathSecurity.js'
 import {
   createPluginFromPath,
@@ -162,8 +166,9 @@ export function mergePluginSources(sources: {
  * the primary entry point for the plugin system.
  */
 export const loadAllPlugins = memoize(async (): Promise<PluginLoadResult> => {
-  const result = await assemblePluginLoadResult(() =>
-    loadPluginsFromMarketplaces({ cacheOnly: false }),
+  const result = await assemblePluginLoadResult(
+    () => loadPluginsFromMarketplaces({ cacheOnly: false }),
+    'full',
   )
   // Warm the cache-only memoize so downstream consumers see just-cloned
   // plugins. Wave D: the cache-only memoize is keyed by targetCwd with
@@ -190,8 +195,9 @@ export const loadAllPluginsCacheOnly = memoize(
     if (isEnvTruthy(process.env.CRABCODE_SYNC_PLUGIN_INSTALL)) {
       return loadAllPlugins()
     }
-    return assemblePluginLoadResult(() =>
-      loadPluginsFromMarketplaces({ cacheOnly: true, targetCwd }),
+    return assemblePluginLoadResult(
+      () => loadPluginsFromMarketplaces({ cacheOnly: true, targetCwd }),
+      `cache-only:${targetCwd ?? '@process'}`,
     )
   },
   (targetCwd?: string) => targetCwd ?? '@process',
@@ -204,15 +210,116 @@ export const loadAllPluginsCacheOnly = memoize(
  * configuration write against the already-installed plugin set.
  */
 export async function loadAllPluginsStrictCacheOnly(): Promise<PluginLoadResult> {
-  return assemblePluginLoadResult(() =>
-    loadPluginsFromMarketplaces({ cacheOnly: true }),
+  return assemblePluginLoadResult(
+    () => loadPluginsFromMarketplaces({ cacheOnly: true }),
+    'strict-cache-only',
   )
+}
+
+/** Pause before the single retry, giving the competing holder time to finish. */
+export const MARKETPLACE_UNAVAILABLE_RETRY_DELAY_MS = 250
+
+/**
+ * Last pass per scope that resolved the marketplace catalog end to end.
+ *
+ * Not a lookup cache: a successful pass always recomputes and overwrites its
+ * entry, and nothing reads this on the success path. It exists only so a pass
+ * that could not reach the catalog at all can keep serving the previous
+ * complete catalog instead of publishing one with plugins missing.
+ */
+const lastCompletePassByScope = new Map<string, PluginLoadResult>()
+
+/** Test-only reset so retained catalogs never leak between cases. */
+export function __resetRetainedPluginCatalogsForTest(): void {
+  lastCompletePassByScope.clear()
 }
 
 /**
  * Shared body of loadAllPlugins and loadAllPluginsCacheOnly.
+ *
+ * A contended marketplace lock aborts the pass instead of yielding a partial
+ * plugin set. The pass is retried once; only if that also fails does the
+ * result degrade — and then to the previous complete catalog plus explicit
+ * `marketplace-load-failed` diagnostics, never to per-plugin
+ * `plugin-not-found` verdicts.
  */
 async function assemblePluginLoadResult(
+  marketplaceLoader: () => Promise<{
+    plugins: LoadedPlugin[]
+    errors: PluginError[]
+  }>,
+  scope: string,
+): Promise<PluginLoadResult> {
+  try {
+    const result = await assembleOnePass(marketplaceLoader)
+    lastCompletePassByScope.set(scope, result)
+    return result
+  } catch (firstError) {
+    if (!(firstError instanceof MarketplaceCatalogUnavailableError)) {
+      throw firstError
+    }
+    logForDebugging(
+      `Marketplace catalog unavailable (${errorMessage(firstError)}); retrying the plugin discovery pass once`,
+      { level: 'warn' },
+    )
+    await Bun.sleep(MARKETPLACE_UNAVAILABLE_RETRY_DELAY_MS)
+    try {
+      const result = await assembleOnePass(marketplaceLoader)
+      lastCompletePassByScope.set(scope, result)
+      return result
+    } catch (retryError) {
+      if (!(retryError instanceof MarketplaceCatalogUnavailableError)) {
+        throw retryError
+      }
+      return await degradeToRetainedCatalog(scope, retryError)
+    }
+  }
+}
+
+/**
+ * Both attempts failed. Report the marketplaces we could not read and keep the
+ * last complete catalog for this scope; if none was ever produced, assemble
+ * the pass with an empty marketplace contribution so builtin and --plugin-dir
+ * plugins still work while the failure stays visible.
+ */
+async function degradeToRetainedCatalog(
+  scope: string,
+  error: MarketplaceCatalogUnavailableError,
+): Promise<PluginLoadResult> {
+  const unavailableErrors: PluginError[] = error.marketplaces.map(
+    marketplace => ({
+      type: 'marketplace-load-failed',
+      source: marketplace,
+      marketplace,
+      reason: `${MARKETPLACE_CATALOG_UNAVAILABLE}: ${errorMessage(error)}`,
+    }),
+  )
+
+  const retained = lastCompletePassByScope.get(scope)
+  if (retained) {
+    logForDebugging(
+      `Marketplace catalog still unavailable after one retry; keeping the previous complete catalog (${retained.enabled.length} enabled, ${retained.disabled.length} disabled)`,
+      { level: 'warn' },
+    )
+    return {
+      enabled: retained.enabled,
+      disabled: retained.disabled,
+      errors: [...retained.errors, ...unavailableErrors],
+    }
+  }
+
+  logForDebugging(
+    'Marketplace catalog unavailable after one retry and no complete catalog exists yet; reporting the marketplaces as unavailable instead of dropping their plugins as not-found',
+    { level: 'warn' },
+  )
+  // Deliberately not retained: this pass never saw the catalog.
+  return assembleOnePass(async () => ({
+    plugins: [],
+    errors: unavailableErrors,
+  }))
+}
+
+async function assembleOnePass(
   marketplaceLoader: () => Promise<{
     plugins: LoadedPlugin[]
     errors: PluginError[]
