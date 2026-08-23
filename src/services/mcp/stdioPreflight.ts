@@ -5,6 +5,7 @@ import type {
   McpServerConfig,
   McpStdioServerConfig,
 } from './types.js'
+import { getFlatBundleInstallRoot } from '../../utils/bundledMode.js'
 import { resolvePluginComponentPath } from '../../utils/plugins/pluginPathSecurity.js'
 
 export type PluginStdioPreflightResult =
@@ -23,6 +24,12 @@ export type PluginStdioPreflightResult =
 export interface PluginStdioPreflightOptions {
   env?: Readonly<Record<string, string | undefined>>
   platform?: NodeJS.Platform
+  /**
+   * Release install root override. Left `undefined` (the default) the live
+   * layout is resolved lazily through `getFlatBundleInstallRoot()`; passing
+   * `null` asserts "not a release install" without touching the filesystem.
+   */
+  installRoot?: string | null
 }
 
 async function canonicalExecutable(
@@ -75,6 +82,45 @@ async function resolveBareExecutable(
   return null
 }
 
+/**
+ * Runtime names a release install root owns a first-party copy of. Deliberately
+ * closed: every other command still resolves through PATH exactly as before.
+ */
+const INSTALL_ROOT_RUNTIMES = new Set(['bun', 'node'])
+
+/**
+ * Prefer `<installRoot>/<name>.exe` over PATH for a bare `bun`/`node`.
+ *
+ * A Windows PATH lookup for a bare `bun` walks PATHEXT (`.COM;.EXE;.BAT;.CMD`)
+ * and npm's global bin directory ships only `bun.cmd` — a batch shim that can
+ * run only under `cmd.exe`. Each plugin MCP server then costs three processes
+ * (wrapper + `cmd.exe` + the real `bun.exe`) instead of two. The release
+ * install root holds the very `bun.exe` this runtime is already executing
+ * under, so preferring it drops the shim hop and settles which `bun` a plugin
+ * gets. On a hit it also skips the whole PATH walk, so it costs fewer syscalls
+ * than the path it replaces.
+ *
+ * Windows-only on purpose: POSIX has no batch-shim layer, so the process count
+ * there is already minimal, and repointing `bun`/`node` away from the user's
+ * PATH toolchain would change behavior for no measured gain.
+ *
+ * Returns `null` whenever the runtime is absent, so the caller falls back to
+ * the unchanged PATH resolution.
+ */
+async function resolveInstallRootRuntime(
+  command: string,
+  platform: NodeJS.Platform,
+  installRoot: () => string | null,
+): Promise<string | null> {
+  if (platform !== 'win32') return null
+  if (!INSTALL_ROOT_RUNTIMES.has(command)) return null
+  const root = installRoot()
+  if (!root) return null
+  // The normal existence + canonicalization contract still applies, so a stale
+  // or half-written install root falls through to PATH instead of being used.
+  return canonicalExecutable(join(root, `${command}.exe`), platform)
+}
+
 function hasPathSeparator(command: string): boolean {
   return command.includes('/') || command.includes('\\')
 }
@@ -95,6 +141,12 @@ export async function preflightPluginStdio(
   const stdio = config as McpStdioServerConfig
   const env = options.env ?? process.env
   const platform = options.platform ?? process.platform
+  // Resolved lazily: only a bare `bun`/`node` on Windows ever needs it, so a
+  // plugin naming anything else pays no filesystem probe for the install root.
+  const installRoot = (): string | null =>
+    options.installRoot !== undefined
+      ? options.installRoot
+      : getFlatBundleInstallRoot()
   const canonicalRoot = await resolvePluginComponentPath(pluginRoot, '.', {
     component: 'plugin MCP cwd',
   })
@@ -119,7 +171,11 @@ export async function preflightPluginStdio(
       command = null
     }
   } else if (!command) {
-    command = await resolveBareExecutable(stdio.command, env, platform)
+    // Bare executable name: the release install root wins over PATH for the
+    // runtimes it ships, and PATH resolution is unchanged for everything else.
+    command =
+      (await resolveInstallRootRuntime(stdio.command, platform, installRoot)) ??
+      (await resolveBareExecutable(stdio.command, env, platform))
   }
 
   if (!command) {
