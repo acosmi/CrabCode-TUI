@@ -20,11 +20,25 @@ const COORDINATOR_RESTART_WINDOW: Duration = Duration::from_secs(60);
 const COORDINATOR_RESTART_BURST: usize = 5;
 const COORDINATOR_BACKOFF_INITIAL: Duration = Duration::from_millis(250);
 const COORDINATOR_BACKOFF_CAP: Duration = Duration::from_secs(30);
-/// CUI serving child + console-less parent: without this flag Windows allocates
-/// a new console window. Do not combine with `DETACHED_PROCESS` (MSDN: that
-/// combination ignores `CREATE_NO_WINDOW`).
+/// Serving-child creation flags: `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`.
+///
+/// The single source of truth for the flags the coordinator hands its serving
+/// child. `Command::creation_flags` is a setter, not a bitwise-or, so the value
+/// must be assembled here rather than across several call sites — see the
+/// spawn site and `serving_child_creation_flags_are_applied_exactly_once`.
+///
+/// `DETACHED_PROCESS` (0x8) leaves the child with no console at all, where
+/// `CREATE_NO_WINDOW` would still allocate a hidden one plus its `conhost.exe`.
+/// No console means no `CTRL_C_EVENT` / `CTRL_BREAK_EVENT` / `CTRL_CLOSE_EVENT`
+/// can be delivered, which removes the `0xC000013A` (`STATUS_CONTROL_C_EXIT`)
+/// restart loop entirely instead of merely hiding the window that caused it.
+/// `CREATE_NEW_PROCESS_GROUP` (0x200) keeps a console control event aimed at
+/// the client from reaching the shared daemon.
+///
+/// Do not add `CREATE_NO_WINDOW` — MSDN specifies it is ignored when combined
+/// with `DETACHED_PROCESS`.
 #[cfg(windows)]
-pub(crate) const SERVING_CHILD_CREATION_FLAGS: u32 = 0x0800_0000;
+pub(crate) const SERVING_CHILD_CREATION_FLAGS: u32 = 0x0000_0208;
 
 /// Returns `true` if `pid` is still alive (or exists but we lack permission to
 /// signal it); `false` only if it is definitively gone.
@@ -166,20 +180,27 @@ async fn run_coordinator() -> Result<()> {
         // (STATUS_CONTROL_C_EXIT) and gets restarted here, spawning yet another
         // window.
         //
-        // CREATE_NO_WINDOW gives the child a console with no window, so nothing
-        // is displayed and nothing can close it, while the inherited stdout and
-        // stderr log-file handles below keep working. CREATE_NEW_PROCESS_GROUP
-        // additionally keeps a console control event aimed at the client from
-        // reaching the shared daemon. Note that CREATE_NO_WINDOW and
-        // DETACHED_PROCESS are mutually exclusive; only the former belongs here
-        // because the child must retain those inherited handles.
+        // SERVING_CHILD_CREATION_FLAGS spawns the child DETACHED_PROCESS, so it
+        // gets no console at all: no window to appear, none to close, and no
+        // channel over which a console control event could be delivered. The
+        // stdout/stderr handles inherited below are the coordinator's own
+        // log-file handles and are unaffected -- DETACHED_PROCESS governs
+        // console inheritance only, which is why the coordinator itself is
+        // launched the same way (acosmi-daemon-launcher/src/spawn_windows.rs)
+        // and still logs normally. Parent-death reclamation does not depend on
+        // a console or a Job either: CRABCODE_PARENT_PID below drives
+        // wait_for_parent_death()'s poll, and kill_on_drop covers the rest.
+        //
+        // Exactly one creation-flags call site: the method is a setter, so a
+        // second one would silently discard this value. That is not a style
+        // preference -- CREATE_NEW_PROCESS_GROUP was lost that way once, when
+        // two branches each added their own call and a rebase ordered the
+        // older one last.
         #[cfg(windows)]
         {
             // `creation_flags` is inherent on tokio's Command on Windows, so no
             // `CommandExt` import is needed here.
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-            command.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+            command.creation_flags(SERVING_CHILD_CREATION_FLAGS);
         }
         command
             .env(COORDINATOR_ENV, "0")
@@ -189,10 +210,6 @@ async fn run_coordinator() -> Result<()> {
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .kill_on_drop(true);
-        #[cfg(windows)]
-        {
-            command.creation_flags(SERVING_CHILD_CREATION_FLAGS);
-        }
 
         let outcome = match command.spawn() {
             Ok(mut child) => {
@@ -342,7 +359,46 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn serving_child_creation_flags_are_create_no_window_only() {
-        assert_eq!(SERVING_CHILD_CREATION_FLAGS, 0x0800_0000);
+    fn serving_child_creation_flags_are_detached_with_a_new_process_group() {
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+        assert_eq!(
+            SERVING_CHILD_CREATION_FLAGS,
+            DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+        );
+        // MSDN: CREATE_NO_WINDOW is ignored when combined with
+        // DETACHED_PROCESS, so carrying it would only mislead a reader.
+        assert_eq!(SERVING_CHILD_CREATION_FLAGS & CREATE_NO_WINDOW, 0);
+    }
+
+    #[test]
+    fn serving_child_creation_flags_are_applied_exactly_once() {
+        // Asserting the constant's value cannot catch the defect this guards
+        // against. `Command::creation_flags` is a setter rather than a
+        // bitwise-or, and neither std nor tokio exposes a getter, so two call
+        // sites on the same builder compile cleanly while the later one
+        // silently discards the earlier -- which is precisely how
+        // CREATE_NEW_PROCESS_GROUP was dropped after a rebase reordered two
+        // branches that had each added their own call. The only place that
+        // defect is observable is the number of call sites, so count them.
+        //
+        // The needle is assembled at compile time so this file's own scanning
+        // code is not itself a match.
+        const NEEDLE: &str = concat!(".creation_flags", "(");
+        let call_sites = include_str!("main.rs")
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .filter(|line| line.contains(NEEDLE))
+            .count();
+
+        assert_eq!(
+            call_sites, 1,
+            "the serving child's creation flags must be set from exactly one \
+             call site (found {call_sites}); a second call overwrites the \
+             first instead of combining with it, so add flags to \
+             SERVING_CHILD_CREATION_FLAGS rather than adding a call"
+        );
     }
 }
