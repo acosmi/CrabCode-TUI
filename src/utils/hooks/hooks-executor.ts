@@ -6,7 +6,9 @@
  * Extracted from src/utils/hooks.ts during responsibility-based decomposition.
  */
 import { spawn, type ChildProcessWithoutNullStreams } from 'child_process'
+import { win32 as windowsPath } from 'path'
 import { pathExists } from '../file.js'
+import { getFlatBundleInstallRoot } from '../bundledMode.js'
 import { wrapSpawn } from '../ShellCommand.js'
 import { TaskOutput } from '../task/TaskOutput.js'
 import { getCwd } from '../cwd.js'
@@ -581,6 +583,92 @@ function processHookJSONOutput({
 }
 
 /**
+ * Put the release install root at the front of a hook child's PATH (Windows).
+ *
+ * Windows hooks run under Git Bash (see the spawn site below), so a hook
+ * command that writes a bare `bun` gets a Git Bash PATH lookup. npm's global
+ * bin directory ships `bun` as a 283-byte `sh` shim, and the shim's MSYS branch
+ * — the one guarded on `uname` reporting MINGW/MSYS/CYGWIN — runs `dirname`,
+ * `sed`, `uname` and `cygpath` before it ever reaches `bun.exe`: six
+ * `CreateProcess` calls per hook where two would do. Measured on this layout,
+ * `bash -c "bun --version"` costs
+ * ~391 ms through the shim and ~163 ms with the install root leading PATH.
+ * `UserPromptSubmit` is a foreground-blocking hook on every turn and
+ * `PreToolUse`/`PostToolUse` fire per tool call, so that tax is paid
+ * constantly.
+ *
+ * Prepending the install root — the directory holding the very `bun.exe` this
+ * runtime already executes under — makes the bare name resolve first-party and
+ * skips the shim entirely. This is the same discipline `stdioPreflight.ts`
+ * applies to plugin MCP stdio servers (P2-11), reached here through PATH
+ * because hook commands are opaque shell strings rather than an argv we can
+ * rewrite.
+ *
+ * Windows-only on purpose: POSIX has no shim layer (`uname` reports Darwin or
+ * Linux, so the shim's MSYS branch never fires) and repointing a hook's
+ * toolchain away from the user's PATH there would change behavior for no gain.
+ * Non-release layouts return `null` from `getFlatBundleInstallRoot()` and are
+ * left exactly as they were, so repo development is untouched.
+ *
+ * The remaining Git Bash hop is deliberately kept. It looks like pure overhead
+ * -- roughly a third of what is left after this fix -- but it is load-bearing.
+ * MSYS rewrites the MSYS-form paths `toHookPath()` produces back into native
+ * ones before the child sees them, using a different convention per channel:
+ * argv arrives as `C:\Users\...` and the same value in the environment as
+ * `C:/Users/...`. Handing that command straight to `bun.exe` instead fails
+ * outright with `error: Module not found "/c/Users/..."`.
+ *
+ * Dropping the shell therefore means reimplementing an undocumented conversion
+ * layer in JS, where getting it subtly wrong silently breaks arbitrary
+ * third-party hook code. That trade is not worth the remaining milliseconds.
+ */
+export function withInstallRootFirstOnPath(
+  env: NodeJS.ProcessEnv,
+  options: {
+    platform?: NodeJS.Platform
+    /**
+     * Release install root override. Left `undefined` (the default) the live
+     * layout is resolved through `getFlatBundleInstallRoot()`; passing `null`
+     * asserts "not a release install" without touching the filesystem.
+     */
+    installRoot?: string | null
+  } = {},
+): NodeJS.ProcessEnv {
+  const platform = options.platform ?? process.platform
+  if (platform !== 'win32') return env
+  const root =
+    options.installRoot !== undefined
+      ? options.installRoot
+      : getFlatBundleInstallRoot()
+  if (!root) return env
+
+  // Windows environment variable names are case-insensitive, but a spread of
+  // `process.env` is a plain object that keeps whatever casing the parent
+  // supplied — `Path` when launched from PowerShell/Explorer, `PATH` from Git
+  // Bash. Adding a second, differently cased key would hand the child two PATH
+  // variables with undefined lookup behavior, so the existing key is rewritten
+  // in place under its original name.
+  const existingKey = Object.keys(env).find(
+    key => key.toLowerCase() === 'path',
+  )
+  const key = existingKey ?? 'PATH'
+  const existingValue = existingKey ? env[existingKey] : undefined
+  // `win32.delimiter` rather than the host-sensitive `delimiter`: this branch
+  // only ever builds a Windows PATH, so it must stay `;` even when a test (or
+  // a future caller) pins the platform from a POSIX host.
+  // Copy rather than mutate. This helper is exported, so a caller that hands
+  // it `process.env` directly must not have the live environment rewritten
+  // underneath it. The guard paths above return the original reference
+  // untouched, so the copy is only paid on the branch that actually changes
+  // something.
+  const next: NodeJS.ProcessEnv = { ...env }
+  next[key] = existingValue
+    ? `${root}${windowsPath.delimiter}${existingValue}`
+    : root
+  return next
+}
+
+/**
  * Execute a command-based hook using bash or PowerShell.
  *
  * Shell resolution: hook.shell → 'bash'. PowerShell hooks spawn pwsh
@@ -722,10 +810,10 @@ export async function execCommandHook(
     : TOOL_HOOK_EXECUTION_TIMEOUT_MS
 
   // Build env vars — all paths go through toHookPath for Windows POSIX conversion
-  const envVars: NodeJS.ProcessEnv = {
+  const envVars: NodeJS.ProcessEnv = withInstallRootFirstOnPath({
     ...subprocessEnv(),
     CRABCODE_PROJECT_DIR: toHookPath(projectDir),
-  }
+  })
 
   // Plugin and skill hooks both set CRABCODE_PLUGIN_ROOT (skills use the same
   // name for consistency — skills can migrate to plugins without code changes)

@@ -443,6 +443,21 @@ const MARKETPLACE_STAGING_DIR_NAME =
   /^\.marketplace-add-(\d+)-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.staging$/i
 
 /**
+ * `.plugin-install-<pid>-<uuid>`, exactly as `cachePluginFromSource()` writes it
+ * for a `preserveTemporaryPath` install (installSources.ts). Anchored for the
+ * same reason as the marketplace pattern above, and here the stakes are higher:
+ * these live in `<plugins>/cache` alongside every *installed* plugin, so a
+ * loose `.plugin-install-*` glob would reach both an in-flight install and the
+ * published caches next to it.
+ *
+ * Note there is no `.staging` suffix to key on — unlike the marketplace path,
+ * the pid and UUID segments are the whole of the evidence, which is why they
+ * are matched exactly rather than wildcarded.
+ */
+const PLUGIN_INSTALL_STAGING_DIR_NAME =
+  /^\.plugin-install-(\d+)-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+/**
  * `snapshot-<zsh|bash|sh>-<epochMs>-<rand>.sh`, exactly as
  * `createAndSaveSnapshot()` writes it. The shell type is a closed set there,
  * so it is spelled out rather than wildcarded — `shell-snapshots/` is under
@@ -502,35 +517,46 @@ function getMarketplacesDirForCleanup(): string {
   return join(getPluginsDirectory(), 'marketplaces')
 }
 
+/** `<plugins>/cache` — the installed-plugin cache root. */
+function getPluginCacheDirForCleanup(): string {
+  return join(getPluginsDirectory(), 'cache')
+}
+
 /**
- * Remove `.marketplace-add-<pid>-<uuid>.staging` directories left behind by
- * interrupted marketplace installs (31 MB across four of them on the machine
- * this was measured on).
+ * Reclaim pid-stamped staging directories directly under `parentDir`.
  *
- * Both guards must hold, and they are an AND, not an OR: the directory must be
- * older than an hour *and* the pid in its name must be gone. The age alone
- * would race a slow clone; the dead pid alone would race pid reuse.
+ * The shared body behind both staging sweeps below, so the guards cannot drift
+ * apart between them. Two must hold, and they are an AND, not an OR: the
+ * directory must be older than an hour *and* the pid in its name must be gone.
+ * The age alone would race a slow clone; the dead pid alone would race pid
+ * reuse. `pattern` must capture the pid as group 1 and must be anchored — a
+ * loose prefix glob would also swallow the path a live install is writing into.
+ *
+ * One directory that cannot be removed costs one `errors` tick and nothing
+ * more; the sweep carries on to the rest.
  */
-export async function cleanupStaleMarketplaceStagingDirs(): Promise<CleanupResult> {
+async function reclaimStalePidStampedDirs(
+  parentDir: string,
+  pattern: RegExp,
+): Promise<CleanupResult> {
   const result: CleanupResult = { messages: 0, errors: 0 }
   const fsImpl = getFsImplementation()
-  const marketplacesDir = getMarketplacesDirForCleanup()
   const cutoffDate = new Date(Date.now() - ONE_HOUR_MS)
 
   let dirents
   try {
-    dirents = await fsImpl.readdir(marketplacesDir)
+    dirents = await fsImpl.readdir(parentDir)
   } catch {
     return result
   }
 
   for (const dirent of dirents) {
     if (!dirent.isDirectory()) continue
-    const match = MARKETPLACE_STAGING_DIR_NAME.exec(dirent.name)
+    const match = pattern.exec(dirent.name)
     if (!match) continue
     if (isProcessAlive(Number(match[1]))) continue
 
-    const stagingPath = join(marketplacesDir, dirent.name)
+    const stagingPath = join(parentDir, dirent.name)
     try {
       const stats = await fsImpl.stat(stagingPath)
       if (stats.mtime >= cutoffDate) continue
@@ -542,6 +568,36 @@ export async function cleanupStaleMarketplaceStagingDirs(): Promise<CleanupResul
   }
 
   return result
+}
+
+/**
+ * Remove `.marketplace-add-<pid>-<uuid>.staging` directories left behind by
+ * interrupted marketplace installs (31 MB across four of them on the machine
+ * this was measured on).
+ */
+export async function cleanupStaleMarketplaceStagingDirs(): Promise<CleanupResult> {
+  return reclaimStalePidStampedDirs(
+    getMarketplacesDirForCleanup(),
+    MARKETPLACE_STAGING_DIR_NAME,
+  )
+}
+
+/**
+ * Remove `.plugin-install-<pid>-<uuid>` directories left behind by interrupted
+ * plugin installs (52 of them, 27 MB, on the machine this was measured on —
+ * all from two pids that had long since exited).
+ *
+ * `cleanupStaleMarketplaceStagingDirs` never reached these: it scans only
+ * `<plugins>/marketplaces` and keys on a `.staging` suffix these names do not
+ * carry, so nothing in the product reclaimed them and they accumulated
+ * indefinitely. Same guards, same retention window — only the directory and the
+ * name shape differ.
+ */
+export async function cleanupStalePluginInstallDirs(): Promise<CleanupResult> {
+  return reclaimStalePidStampedDirs(
+    getPluginCacheDirForCleanup(),
+    PLUGIN_INSTALL_STAGING_DIR_NAME,
+  )
 }
 
 /**
@@ -919,6 +975,7 @@ async function cleanupOldMessageFilesCore(): Promise<void> {
   await cleanupOldImageCaches()
   await cleanupOldPastes(getCutoffDate())
   await cleanupStaleMarketplaceStagingDirs()
+  await cleanupStalePluginInstallDirs()
   await cleanupOldShellSnapshots()
   await cleanupOrphanedMarketplaceDirs()
   await cleanupSupersededInstallVersions()
