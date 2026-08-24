@@ -1,15 +1,18 @@
 // P2-10 (2026-08-23 Windows startup audit) —— 启动期磁盘残留回收。
 //
-// 这四项清理会删除用户主目录下的目录树，所以本文件钉的**首先是护栏**，其次才是
+// 这几项清理会删除用户主目录下的目录树，所以本文件钉的**首先是护栏**，其次才是
 // 「该删的确实删了」：
 //
 //   1. `.marketplace-add-<pid>-<uuid>.staging` —— mtime 超 1 小时 **且** pid 已退出。
 //      两条是「与」。任一不满足都必须留着，因为删错的对象是一个正在进行的安装。
-//   2. `shell-snapshots/snapshot-<shell>-<ts>-<rand>.sh` —— 超 7 天才删，且只认这一个
+//   2. `cache/.plugin-install-<pid>-<uuid>` —— 同样的两条护栏、同一个保留窗口。
+//      该目录与**已安装**的插件缓存同级，且名字没有 `.staging` 后缀可依赖，因此
+//      pid 段与 UUID 段就是全部证据，必须整体精确匹配。
+//   3. `shell-snapshots/snapshot-<shell>-<ts>-<rand>.sh` —— 超 7 天才删，且只认这一个
 //      文件名形状（目录在用户 config home 下，宽松通配会误伤）。
-//   3. `versions/<v>/` —— `.current` 指向的、以及**当前进程实际所在**的，两个都留。
+//   4. `versions/<v>/` —— `.current` 指向的、以及**当前进程实际所在**的，两个都留。
 //      后者由 `process.execPath` 溯源，不信 `.current`；任何一处判断不出来就整轮不删。
-//   4. 孤儿 marketplace 目录 —— `known_marketplaces.json` 读不到/解析不了/形状不对时
+//   5. 孤儿 marketplace 目录 —— `known_marketplaces.json` 读不到/解析不了/形状不对时
 //      **一个都不删**，「读不到注册表」不等于「没有引用」。
 //
 // 隔离：`CRABCODE_PLUGIN_CACHE_DIR` + `CRABCODE_CONFIG_DIR` 指向本进程的临时目录，
@@ -35,6 +38,7 @@ import {
   cleanupOldShellSnapshots,
   cleanupOrphanedMarketplaceDirs,
   cleanupStaleMarketplaceStagingDirs,
+  cleanupStalePluginInstallDirs,
   cleanupSupersededInstallVersions,
 } from '../../src/utils/cleanup.js'
 import { getCrabCodeConfigHomeDir } from '../../src/utils/envUtils.js'
@@ -205,6 +209,139 @@ describe('marketplace add-staging reclamation', () => {
 
     for (const path of survivors) expect(existsSync(path)).toBe(true)
     expect(result).toEqual({ messages: 0, errors: 0 })
+  })
+})
+
+describe('plugin install staging reclamation', () => {
+  function setup(): string {
+    const caseDir = freshCase('plugin-install')
+    isolateUserDirs(caseDir)
+    const cacheDir = join(getPluginsDirectory(), 'cache')
+    mkdirSync(cacheDir, { recursive: true })
+    return cacheDir
+  }
+
+  function makeInstallDir(cacheDir: string, pid: number, ageMs: number): string {
+    const path = join(cacheDir, `.plugin-install-${pid}-${randomUUID()}`)
+    mkdirSync(path, { recursive: true })
+    writeFileSync(join(path, 'plugin.json'), '{}')
+    ageOf(path, ageMs)
+    return path
+  }
+
+  test('removes an hours-old install directory whose pid has exited', async () => {
+    const cacheDir = setup()
+    const stale = makeInstallDir(cacheDir, findDeadPid(), 20 * DAY_MS)
+
+    const result = await cleanupStalePluginInstallDirs()
+
+    expect(existsSync(stale)).toBe(false)
+    expect(result).toEqual({ messages: 1, errors: 0 })
+  })
+
+  test('keeps an install directory whose pid is still alive, however old', async () => {
+    const cacheDir = setup()
+    const alive = makeInstallDir(cacheDir, process.pid, 30 * DAY_MS)
+    const dead = makeInstallDir(cacheDir, findDeadPid(), 30 * DAY_MS)
+
+    const result = await cleanupStalePluginInstallDirs()
+
+    expect(existsSync(alive)).toBe(true)
+    expect(existsSync(dead)).toBe(false)
+    expect(result).toEqual({ messages: 1, errors: 0 })
+  })
+
+  test('keeps an install directory younger than an hour even when its pid is gone', async () => {
+    const cacheDir = setup()
+    const deadPid = findDeadPid()
+    const young = makeInstallDir(cacheDir, deadPid, 59 * 60 * 1000)
+    const old = makeInstallDir(cacheDir, deadPid, 61 * 60 * 1000)
+
+    const result = await cleanupStalePluginInstallDirs()
+
+    expect(existsSync(young)).toBe(true)
+    expect(existsSync(old)).toBe(false)
+    expect(result).toEqual({ messages: 1, errors: 0 })
+  })
+
+  test('ignores names that are not the exact install-staging shape', async () => {
+    const cacheDir = setup()
+    const deadPid = findDeadPid()
+    const survivors = [
+      // No uuid at all.
+      join(cacheDir, '.plugin-install-abc'),
+      // pid but no uuid.
+      join(cacheDir, `.plugin-install-${deadPid}`),
+      // Missing the leading dot.
+      join(cacheDir, `plugin-install-${deadPid}-${randomUUID()}`),
+      // A `.staging` suffix the writer never emits — that belongs to the
+      // marketplace sweep, whose directory this is not.
+      join(cacheDir, `.plugin-install-${deadPid}-${randomUUID()}.staging`),
+      // Non-UUID tail.
+      join(cacheDir, `.plugin-install-${deadPid}-not-a-uuid`),
+      // Trailing junk after an otherwise valid uuid.
+      join(cacheDir, `.plugin-install-${deadPid}-${randomUUID()}-old`),
+    ]
+    for (const path of survivors) {
+      mkdirSync(path, { recursive: true })
+      ageOf(path, 30 * DAY_MS)
+    }
+
+    const result = await cleanupStalePluginInstallDirs()
+
+    for (const path of survivors) expect(existsSync(path)).toBe(true)
+    expect(result).toEqual({ messages: 0, errors: 0 })
+  })
+
+  test('never touches the installed plugin caches it sits beside', async () => {
+    const cacheDir = setup()
+    // The shapes `generateTemporaryCacheNameForPlugin()` and the installed
+    // plugin trees actually put in `<plugins>/cache`.
+    const survivors = [
+      join(cacheDir, 'crabcode-plugins-official'),
+      join(cacheDir, 'hookify'),
+      join(cacheDir, 'github-acosmi-CrabCode-Plugin-1783172641412-cf4pvs'),
+      join(cacheDir, 'local-1783172641412-cf4pvs'),
+    ]
+    for (const path of survivors) {
+      mkdirSync(join(path, 'commands'), { recursive: true })
+      writeFileSync(join(path, 'plugin.json'), '{}')
+      ageOf(path, 90 * DAY_MS)
+    }
+
+    const result = await cleanupStalePluginInstallDirs()
+
+    for (const path of survivors) expect(existsSync(path)).toBe(true)
+    expect(result).toEqual({ messages: 0, errors: 0 })
+    // The cache root itself must survive — installs write into it.
+    expect(existsSync(cacheDir)).toBe(true)
+  })
+
+  test('leaves the marketplace staging sweep to its own directory', async () => {
+    // The two sweeps share a body; each must still only reach its own root.
+    const cacheDir = setup()
+    const marketplacesDir = join(getPluginsDirectory(), 'marketplaces')
+    mkdirSync(marketplacesDir, { recursive: true })
+    const deadPid = findDeadPid()
+    const marketplaceStaging = makeStagingDir(
+      marketplacesDir,
+      deadPid,
+      30 * DAY_MS,
+    )
+    const installStaging = makeInstallDir(cacheDir, deadPid, 30 * DAY_MS)
+
+    expect(await cleanupStalePluginInstallDirs()).toEqual({
+      messages: 1,
+      errors: 0,
+    })
+    expect(existsSync(installStaging)).toBe(false)
+    expect(existsSync(marketplaceStaging)).toBe(true)
+
+    expect(await cleanupStaleMarketplaceStagingDirs()).toEqual({
+      messages: 1,
+      errors: 0,
+    })
+    expect(existsSync(marketplaceStaging)).toBe(false)
   })
 })
 
