@@ -609,6 +609,18 @@ function processHookJSONOutput({
  * toolchain away from the user's PATH there would change behavior for no gain.
  * Non-release layouts return `null` from `getFlatBundleInstallRoot()` and are
  * left exactly as they were, so repo development is untouched.
+ *
+ * The remaining Git Bash hop is deliberately kept. It looks like pure overhead
+ * -- roughly a third of what is left after this fix -- but it is load-bearing.
+ * MSYS rewrites the MSYS-form paths `toHookPath()` produces back into native
+ * ones before the child sees them, using a different convention per channel:
+ * argv arrives as `C:\Users\...` and the same value in the environment as
+ * `C:/Users/...`. Handing that command straight to `bun.exe` instead fails
+ * outright with `error: Module not found "/c/Users/..."`.
+ *
+ * Dropping the shell therefore means reimplementing an undocumented conversion
+ * layer in JS, where getting it subtly wrong silently breaks arbitrary
+ * third-party hook code. That trade is not worth the remaining milliseconds.
  */
 export function withInstallRootFirstOnPath(
   env: NodeJS.ProcessEnv,
